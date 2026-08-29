@@ -2,6 +2,10 @@
 
 一个 Manifest V3 Chromium 扩展。采用网页内可拖动小浮窗作为任务控制台，按站点保存配置，可自动播放/恢复 HTML5 视频、阅读课件、调整倍速、切换下一节，还可连接采用 Chat Completions 格式的第三方 AI 接口识别并填写页面题目。
 
+## 下载
+
+直接下载打包好的扩展：[release/yueyue-shuake-v3.5.3.zip](release/yueyue-shuake-v3.5.3.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+
 ## 安装
 
 1. 打开 Chrome/Edge 的扩展管理页：`chrome://extensions` 或 `edge://extensions`。
