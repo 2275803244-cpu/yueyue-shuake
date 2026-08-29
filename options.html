@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>玥玥刷客 - AI 设置</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <h1>AI 接口与题目识别设置</h1>
+      <p class="lead">支持采用 Chat Completions 请求格式的第三方接口。密钥仅保存在当前浏览器的扩展本地存储中。</p>
+
+      <section>
+        <h2>接口</h2>
+        <label>国内模型接口预设
+          <select id="providerPreset">
+            <option value="deepseek">DeepSeek</option>
+            <option value="dashscope">阿里云百炼 · 通义千问</option>
+            <option value="zhipu">智谱 AI · GLM</option>
+            <option value="moonshot">月之暗面 · Kimi</option>
+            <option value="siliconflow">硅基流动</option>
+            <option value="volcengine">火山引擎 · 方舟</option>
+            <option value="custom">自定义兼容接口</option>
+          </select>
+        </label>
+        <label>完整接口 URL<input id="endpoint" type="url" placeholder="https://example.com/v1/chat/completions"></label>
+        <div class="grid">
+          <label>模型名 / 推理接入点 ID<input id="model" placeholder="model-name"></label>
+          <label>API Key<input id="apiKey" type="password" autocomplete="off"></label>
+          <label>认证请求头<input id="authHeader" placeholder="Authorization"></label>
+          <label>认证前缀<input id="authPrefix" placeholder="Bearer"></label>
+        </div>
+        <label>附加请求头（JSON）<textarea id="extraHeaders" rows="3" spellcheck="false">{}</textarea></label>
+        <div class="grid">
+          <label>请求超时（毫秒）<input id="requestTimeoutMs" type="number" min="5000" max="120000" step="1000"></label>
+          <label>失败重试次数<input id="retryCount" type="number" min="0" max="5"></label>
+          <label>重试间隔（毫秒）<input id="retryDelayMs" type="number" min="200" max="10000" step="100"></label>
+        </div>
+        <label class="checkbox"><input id="enhanceMode" type="checkbox">高准确率模式（逐题请求并由 AI 二次复核，更准但更慢、更耗额度）</label>
+        <label class="checkbox"><input id="enableCache" type="checkbox">启用答案缓存（相同题目 7 天内直接复用，不重复请求）</label>
+      </section>
+
+      <section>
+        <h2>网页题目选择器</h2>
+        <p class="hint">默认规则适合常见页面。特定平台不识别时，用开发者工具检查元素后填写 CSS 选择器。</p>
+        <label>每道题的容器<input id="questionSelector"></label>
+        <label>题干元素（相对于题目容器）<input id="stemSelector"></label>
+        <label>选项元素（相对于题目容器）<input id="optionSelector"></label>
+        <label>提交按钮<input id="submitSelector"></label>
+      </section>
+
+      <section>
+        <h2>提示词</h2>
+        <label>系统提示词<textarea id="systemPrompt" rows="7"></textarea></label>
+      </section>
+
+      <div class="actions">
+        <button id="save">保存设置</button>
+        <button id="test" class="secondary">测试 AI 接口</button>
+      </div>
+      <p id="status" aria-live="polite"></p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>
