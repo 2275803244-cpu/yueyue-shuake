@@ -4,7 +4,8 @@
 
 ## 下载
 
-直接下载打包好的扩展：[release/yueyue-shuake-v3.5.3.zip](release/yueyue-shuake-v3.5.3.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.6.0.zip](release/yueyue-shuake-v3.6.0.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+- 用户脚本版（脚本猫 / 油猴）：[userscript/yueyue-shuake.user.js](userscript/yueyue-shuake.user.js)，安装说明见 [userscript/README.md](userscript/README.md)。
 
 ## 安装
 
