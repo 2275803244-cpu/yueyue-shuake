@@ -741,6 +741,7 @@
         : element.querySelector('input[type="radio"], input[type="checkbox"]');
       const ariaLabel = element.getAttribute("aria-label") || element.closest("[aria-label]")?.getAttribute("aria-label") || "";
       let text = normalizeAnswerText(element.innerText || element.textContent || control?.value || ariaLabel);
+      if (/^第\s*\d+\s*空[:：]?$/.test(text)) continue;
       if (questionType === "judgement") {
         const probe = `${text} ${ariaLabel}`;
         if (/(^|[^不])对|正确|true|right|√/i.test(probe)) text = "正确";
