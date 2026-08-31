@@ -234,7 +234,7 @@
         .task-line{min-height:28px;padding:7px 8px;border-radius:8px;color:#687287;background:#f7f8fb;font-size:9px;line-height:1.4}
         .master{display:flex;align-items:center;justify-content:space-between;margin:9px 0;padding:8px 9px;border-radius:9px;background:color-mix(in srgb,var(--accent) 12%,white)}.master strong{font-size:11px}.switch{position:relative;width:34px;height:20px}.switch input{position:absolute;opacity:0}.switch i{display:block;width:34px;height:20px;border-radius:99px;background:#cbd1dc;transition:.2s}.switch i:after{content:'';position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:.2s}.switch input:checked+i{background:var(--accent)}.switch input:checked+i:after{transform:translateX(14px)}
         .options{display:grid;grid-template-columns:1fr 1fr;gap:7px}.check{display:flex;align-items:center;gap:5px;min-height:29px;padding:6px 7px;border:1px solid #e5e8ef;border-radius:8px;color:#536076;font-size:9px}.check input{margin:0;accent-color:#6757ef}.speed{display:flex;align-items:center;justify-content:space-between}.speed select{width:64px;padding:3px;border:1px solid #d8dde7;border-radius:6px;background:#fff;font-size:9px}
-        .actions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:9px}.action{min-height:32px;padding:7px;border:0;border-radius:8px;font-size:10px;font-weight:700}.answer{color:#153f30;background:#c8f3df}.model{color:#fff;background:var(--accent)}
+        .actions{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:9px}.action{min-height:32px;padding:7px 4px;border:0;border-radius:8px;font-size:10px;font-weight:700}.answer{color:#153f30;background:#c8f3df}.model{color:#fff;background:var(--accent)}.diag{color:#3d4450;background:#e8ebf2}
         .customizer{margin-bottom:9px;padding:9px;border:1px solid #e4e7ef;border-radius:10px;background:#f8f9fc}.customizer[hidden]{display:none}.custom-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}.custom-head strong{font-size:10px}.reset{padding:0;border:0;color:var(--accent);background:transparent;font-size:9px}.custom-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.custom-field{display:flex;flex-direction:column;gap:4px;color:#69748a;font-size:8px}.custom-field select,.custom-field input[type=range]{width:100%}.opacity-label{display:flex;justify-content:space-between}.theme-row{display:flex;gap:6px}.theme-dot{width:20px;height:20px;padding:0;border:2px solid transparent;border-radius:50%;background:var(--dot)}.theme-dot.active{border-color:#172033;box-shadow:0 0 0 2px #fff inset}.compact-check{display:flex;align-items:center;gap:5px;color:#58647a;font-size:9px}.compact-check input{accent-color:var(--accent)}.panel.compact .metrics,.panel.compact .task-line{display:none}.panel.compact .status{margin-bottom:8px}
       </style>
       <section class="panel">
@@ -268,7 +268,7 @@
             <label class="check"><input class="skip-completed" type="checkbox">完成即跳过</label>
             <label class="check speed">速度<select class="rate"><option value="1">1.0×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2.0×</option></select></label>
           </div>
-          <div class="actions"><button class="action answer">立即答题</button><button class="action model">模型设置</button></div>
+          <div class="actions"><button class="action answer">立即答题</button><button class="action model">模型设置</button><button class="action diag">复制诊断</button></div>
         </div>
       </section>`;
     document.documentElement.append(host);
@@ -327,6 +327,41 @@
       }
     });
     find(".model").addEventListener("click", () => chrome.runtime.sendMessage({ type: "OPEN_OPTIONS" }).catch(() => {}));
+    find(".diag").addEventListener("click", async () => {
+      publishStatus({ phase: "scanning", message: "正在收集全部 frame 的诊断信息…" });
+      try {
+        const result = await chrome.runtime.sendMessage({ type: "DIAGNOSE_ALL_FRAMES" });
+        const lines = ["=== 玥玥刷客诊断 ===", `页面：${location.href}`];
+        let totalQuestions = 0;
+        for (const item of result?.results || []) {
+          const frame = item?.response;
+          if (!frame?.ok) { lines.push(`frame#${item.frameId}：${frame?.error || "无响应（可能无脚本）"}`); continue; }
+          totalQuestions += frame.questions?.length || 0;
+          lines.push(`frame#${item.frameId}（${frame.url}）：识别 ${frame.questions?.length || 0} 题`);
+          for (const question of frame.questions || []) {
+            lines.push(`  Q${question.index + 1} [${question.type}] 空${question.blanks} 选项${question.options} 控件:${question.controls.join(",") || "无"} 「${question.stem}」`);
+          }
+          for (const record of frame.lastFillReport || []) {
+            lines.push(`  上轮 Q${record.q + 1} 未填：${record.reason}（${record.type} 空${record.blanks} 选项${record.options}）`);
+          }
+        }
+        lines.push(`合计识别 ${totalQuestions} 题`);
+        const text = lines.join("\n");
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          const helper = document.createElement("textarea");
+          helper.value = text;
+          document.documentElement.append(helper);
+          helper.select();
+          document.execCommand("copy");
+          helper.remove();
+        }
+        publishStatus({ phase: "done", message: `诊断已复制（${totalQuestions} 题），粘贴给开发者即可定位问题` });
+      } catch (error) {
+        publishStatus({ phase: "error", message: `诊断失败：${error.message}` });
+      }
+    });
     find(".close").addEventListener("click", () => setFloatingVisible(false));
     find(".customize").addEventListener("click", () => { floatingUi.customizer.hidden = !floatingUi.customizer.hidden; });
     floatingUi.customWidth.addEventListener("change", () => saveFloatingCustomization({ width: Number(floatingUi.customWidth.value) }));
@@ -755,6 +790,18 @@
     return options;
   }
 
+  function editableControls(container) {
+    const direct = [...container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')]
+      .filter((element) => element.tagName !== "IFRAME");
+    const editorBodies = [...container.querySelectorAll("iframe")].flatMap((frame) => {
+      try {
+        const body = frame.contentDocument?.body;
+        return body && (body.isContentEditable || body.getAttribute("contenteditable") === "true") ? [body] : [];
+      } catch { return []; }
+    });
+    return [...direct, ...editorBodies].filter(isUsable);
+  }
+
   function extractQuestions(aiConfig) {
     let containers;
     try {
@@ -771,7 +818,7 @@
     return containers.map((container) => {
       const explicitType = detectQuestionType(container);
       const options = readOptionElements(container, aiConfig.optionSelector, explicitType);
-      const textControls = [...container.querySelectorAll('textarea, input[type="text"], input:not([type])')].filter(isUsable);
+      const textControls = editableControls(container);
       if (!options.length && !textControls.length) return null;
 
       let stemElement;
@@ -805,6 +852,14 @@
   }
 
   function setTextControl(control, value) {
+    const ownerDocument = control.ownerDocument || document;
+    if (control.isContentEditable || control.getAttribute?.("contenteditable") === "true") {
+      control.focus?.();
+      control.textContent = value;
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
     const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
     if (setter) setter.call(control, value);
@@ -813,13 +868,17 @@
     control.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  let lastFillReport = [];
+
   function applyAnswers(questions, answers) {
     let filledCount = 0;
+    lastFillReport = [];
     for (const answer of answers) {
       const questionIndex = Number(answer?.question);
       const question = questions[questionIndex];
-      if (!question) continue;
+      if (!question) { lastFillReport.push({ q: questionIndex, ok: false, reason: "题号不存在" }); continue; }
       let changed = false;
+      let reason = "";
 
       if (question.optionElements.length && Array.isArray(answer.choices)) {
         const indexedChoices = answer.choices.map(Number).filter(Number.isInteger);
@@ -828,6 +887,7 @@
           ? textChoices.map((text) => question.optionElements.findIndex(({ text: optionText }) => normalizeAnswerText(optionText) === text)).filter((index) => index >= 0)
           : [];
         const selected = new Set(textChoices.length > 0 && exactIndexes.length === textChoices.length ? exactIndexes : indexedChoices);
+        if (!selected.size) reason = "AI 的选项索引与原文都匹配不上";
         question.optionElements.forEach(({ element, control }, index) => {
           const shouldSelect = selected.has(index);
           const ariaSelected = element.getAttribute("aria-checked") === "true" || element.classList.contains("selected") || element.classList.contains("active");
@@ -858,6 +918,9 @@
         }
         const fallback = single ? [single] : [];
         const values = perBlank.length === question.textControls.length && perBlank.some(Boolean) ? perBlank : fallback;
+        if (!values.length || values.length !== question.textControls.length) {
+          reason = `空数不符：题目 ${question.textControls.length} 空，AI 返回 ${perBlank.length || (single ? 1 : 0)} 份`;
+        }
         let filledBlanks = 0;
         question.textControls.forEach((control, index) => {
           const value = values[index];
@@ -870,6 +933,11 @@
       }
 
       if (changed) filledCount += 1;
+      else lastFillReport.push({
+        q: questionIndex, type: question.type,
+        blanks: question.textControls.length, options: question.optionElements.length,
+        reason: reason || "AI 未返回这道题可用的答案"
+      });
     }
     return filledCount;
   }
@@ -1220,8 +1288,34 @@
       sendResponse({ ok: true });
       return false;
     }
-    if (!message || !["APPLY_SETTINGS", "RESCAN", "ANSWER_NOW", "GET_STATUS", "TOGGLE_FLOAT"].includes(message.type)) return;
+    if (!message || !["APPLY_SETTINGS", "RESCAN", "ANSWER_NOW", "GET_STATUS", "TOGGLE_FLOAT", "DIAGNOSE_NOW"].includes(message.type)) return;
     loadSettings().then(() => {
+      if (message.type === "DIAGNOSE_NOW") {
+        chrome.storage.local.get("aiConfig").then((stored) => {
+          try {
+            const aiConfig = buildAiConfig(stored.aiConfig || {});
+            const questions = extractQuestions(aiConfig);
+            sendResponse({
+              ok: true,
+              url: location.href,
+              questions: questions.map((question, index) => ({
+                index,
+                type: question.type,
+                blanks: question.textControls.length,
+                options: question.optionElements.length,
+                controls: question.textControls.slice(0, 4).map((control) =>
+                  `${control.tagName || "?"}${control.className && typeof control.className === "string" ? "." + control.className.split(" ").filter(Boolean)[0] : ""}${control.isContentEditable ? "[CE]" : ""}`
+                ),
+                stem: question.payload.stem.slice(0, 24)
+              })),
+              lastFillReport
+            });
+          } catch (error) {
+            sendResponse({ ok: false, error: error.message });
+          }
+        });
+        return;
+      }
       if (message.type === "TOGGLE_FLOAT") {
         initFloatingWindow().then(() => {
           if (!floatingUi) return sendResponse({ ok: false });

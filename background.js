@@ -88,6 +88,18 @@ async function answerAllFrames(tabId) {
   };
 }
 
+async function diagnoseAllFrames(tabId) {
+  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  const results = await Promise.all((frames || []).map(async ({ frameId }) => {
+    try {
+      return { frameId, response: await chrome.tabs.sendMessage(tabId, { type: "DIAGNOSE_NOW" }, { frameId }) };
+    } catch (error) {
+      return { frameId, response: { ok: false, error: error.message } };
+    }
+  }));
+  return { ok: true, questionCount: results.reduce((sum, item) => sum + (item.response?.questions?.length || 0), 0), results };
+}
+
 function hashText(text) {
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
@@ -277,6 +289,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === "ANSWER_ALL_FRAMES" && sender.tab?.id) {
     answerAllFrames(sender.tab.id)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "DIAGNOSE_ALL_FRAMES" && sender.tab?.id) {
+    diagnoseAllFrames(sender.tab.id)
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
