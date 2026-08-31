@@ -117,7 +117,7 @@ function parseJsonReply(content) {
 }
 
 function answerSchemaRules() {
-  return '严格输出：{"answers":[{"question":0,"choices":[0],"choiceTexts":["选项原文"],"textAnswers":[""],"textAnswer":""}]}。选择题必须同时给出 choices 和 choiceTexts，并确保二者指向同一选项；多空填空题（题目带 blanks 数量）必须返回与空数等长的 textAnswers 数组；单空文本题填写 textAnswer。判断题将“对/正确/True/√”视为正确，将“错/错误/False/×”视为错误。';
+  return '严格输出：{"answers":[{"question":0,"choices":[0],"choiceTexts":["选项原文"],"textAnswers":[""],"textAnswer":""}]}。选择题必须同时给出 choices 和 choiceTexts，并确保二者指向同一选项；多空填空题（题目带 blanks 数量）必须在 textAnswers 数组里按空顺序逐空给出答案，禁止把多个空的答案用顿号、斜杠合并进一个字符串；单空文本题填写 textAnswer。判断题将“对/正确/True/√”视为正确，将“错/错误/False/×”视为错误。';
 }
 
 async function chatCompletion(config, endpoint, headers, messages) {

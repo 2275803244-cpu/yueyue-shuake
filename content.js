@@ -847,8 +847,16 @@
           }
         });
       } else if (question.textControls.length) {
-        const perBlank = Array.isArray(answer.textAnswers) ? answer.textAnswers.map((value) => String(value ?? "").trim()) : [];
-        const fallback = typeof answer.textAnswer === "string" ? [answer.textAnswer.trim()] : [];
+        let perBlank = Array.isArray(answer.textAnswers) ? answer.textAnswers.map((value) => String(value ?? "").trim()) : [];
+        const single = typeof answer.textAnswer === "string" ? answer.textAnswer.trim() : "";
+        if (perBlank.length !== question.textControls.length && question.textControls.length > 1 && single) {
+          const parts = single
+            .split(/[/／；;，,、]|和|与/)
+            .map((part) => part.replace(/^第\s*\d+\s*空[:：]?\s*/, "").trim())
+            .filter(Boolean);
+          if (parts.length === question.textControls.length) perBlank = parts;
+        }
+        const fallback = single ? [single] : [];
         const values = perBlank.length === question.textControls.length && perBlank.some(Boolean) ? perBlank : fallback;
         let filledBlanks = 0;
         question.textControls.forEach((control, index) => {
