@@ -307,8 +307,21 @@
       publishStatus({ phase: "answering", message: "正在扫描顶层页面和所有题目 iframe" });
       try {
         const result = await chrome.runtime.sendMessage({ type: "ANSWER_ALL_FRAMES" });
-        if (!result?.ok) publishStatus({ phase: "error", questionCount: 0, message: result?.error || "所有 frame 均未识别到题目" });
-        else publishStatus({ phase: "done", questionCount: result.questionCount, filledCount: result.filledCount, message: `跨 frame 答题完成：${result.filledCount}/${result.questionCount}` });
+        if (!result?.ok) {
+          const frameResults = Array.isArray(result?.results) ? result.results : [];
+          const frameErrors = frameResults
+            .map((item) => item?.response?.answerResult?.error || item?.response?.error)
+            .filter(Boolean);
+          const failing = frameResults.find((item) => item?.response?.answerResult?.questionCount > 0 && !item.response.ok);
+          const foundCount = Number(result?.questionCount || 0);
+          const reason = failing?.response?.answerResult?.error || frameErrors[0] || "所有 frame 均未识别到题目";
+          publishStatus({
+            phase: "error", questionCount: foundCount, filledCount: 0,
+            message: foundCount > 0 ? `识别 ${foundCount} 题，填写失败：${reason}` : reason
+          });
+        } else {
+          publishStatus({ phase: "done", questionCount: result.questionCount, filledCount: result.filledCount, message: `跨 frame 答题完成：${result.filledCount}/${result.questionCount}` });
+        }
       } catch (error) {
         publishStatus({ phase: "error", message: `跨 frame 答题失败：${error.message}` });
       }
