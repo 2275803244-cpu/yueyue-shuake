@@ -347,6 +347,16 @@
           for (const note of frame.extractNotes || []) {
             lines.push(`  提取警告：${note}`);
           }
+          for (const question of frame.questions || []) {
+            if (question.containerHtml) lines.push(`  Q${question.index + 1} 容器HTML: ${question.containerHtml}`);
+            if (question.parentHtml) lines.push(`  Q${question.index + 1} 父级HTML: ${question.parentHtml}`);
+          }
+          if (frame.allControls?.length) {
+            lines.push(`  全frame输入控件 ${frame.allControls.length} 个：`);
+            for (const control of frame.allControls) {
+              lines.push(`    #${control.index} ${control.tag}${control.type ? `[${control.type}]` : ""} 值:「${control.value}」 链: ${control.ancestry}`);
+            }
+          }
         }
         lines.push(`合计识别 ${totalQuestions} 题`);
         const text = lines.join("\n");
@@ -793,16 +803,48 @@
     return options;
   }
 
-  function editableControls(container) {
-    const direct = [...container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')]
-      .filter((element) => element.tagName !== "IFRAME");
-    const editorBodies = [...container.querySelectorAll("iframe")].flatMap((frame) => {
+  const editableFrameByBody = new WeakMap();
+  function editorBodiesIn(scope) {
+    return [...scope.querySelectorAll("iframe")].flatMap((frame) => {
       try {
         const body = frame.contentDocument?.body;
-        return body && (body.isContentEditable || body.getAttribute("contenteditable") === "true") ? [body] : [];
+        if (body && (body.isContentEditable || body.getAttribute("contenteditable") === "true")) {
+          editableFrameByBody.set(body, frame);
+          return [body];
+        }
+        return [];
       } catch { return []; }
     });
-    return [...direct, ...editorBodies].filter(isUsable);
+  }
+
+  // 学习通新版填空题：每个 .blankItemDiv 是一个空，里面同时有 InpDIV（普通）与 textDIV（UEditor），
+  // 两套控件互斥可见甚至全部隐藏——每个空只取一个代表控件，富文本与原生 textarea 双写。
+  function editableControls(container) {
+    const blankItems = [...container.querySelectorAll(".blankItemDiv")];
+    const controls = [];
+    const push = (element) => { if (element && !controls.includes(element)) controls.push(element); };
+    for (const blank of blankItems) {
+      const ceBodies = editorBodiesIn(blank);
+      const inputs = [...blank.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')];
+      push(ceBodies.find(isUsable) || inputs.find(isUsable) || ceBodies[0] || inputs[0]);
+    }
+    const outside = (element) => !blankItems.some((blank) => blank.contains(element));
+    if (controls.length) {
+      for (const body of editorBodiesIn(container)) {
+        if (isUsable(body) && outside(body)) push(body);
+      }
+      for (const input of container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')) {
+        if (isUsable(input) && outside(input)) push(input);
+      }
+      return controls;
+    }
+    const visible = [
+      ...editorBodiesIn(container),
+      ...container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')
+    ].filter(isUsable);
+    if (visible.length) return visible;
+    // 全部隐藏时仍尝试（题干护栏会拦住垃圾题），有总比空强
+    return [...editorBodiesIn(container), ...container.querySelectorAll('textarea, input[type="text"], input:not([type])')];
   }
 
   function extractQuestions(aiConfig) {
@@ -857,7 +899,7 @@
           question: 0,
           type,
           stem,
-          options: options.map(({ text }) => text),
+          options: type === "text" ? [] : options.map(({ text }) => text),
           ...(textControls.length > 1 ? { blanks: textControls.length } : {})
         }
       };
@@ -868,20 +910,31 @@
   }
 
   function setTextControl(control, value) {
-    const ownerDocument = control.ownerDocument || document;
+    const dispatch = (target) => {
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+    };
     if (control.isContentEditable || control.getAttribute?.("contenteditable") === "true") {
       control.focus?.();
       control.textContent = value;
-      control.dispatchEvent(new Event("input", { bubbles: true }));
-      control.dispatchEvent(new Event("change", { bubbles: true }));
+      dispatch(control);
+      // UEditor 双写：把答案同步到同一空/同题的原生 textarea，兼容平台只读其一
+      const frame = editableFrameByBody.get(control);
+      const host = frame?.closest?.(".blankItemDiv, li") || null;
+      for (const textarea of host?.querySelectorAll("textarea") || []) {
+        if (textarea.value !== value) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+          if (setter) setter.call(textarea, value); else textarea.value = value;
+          dispatch(textarea);
+        }
+      }
       return;
     }
     const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
     if (setter) setter.call(control, value);
     else control.value = value;
-    control.dispatchEvent(new Event("input", { bubbles: true }));
-    control.dispatchEvent(new Event("change", { bubbles: true }));
+    dispatch(control);
   }
 
   let lastFillReport = [];
@@ -1312,6 +1365,27 @@
           try {
             const aiConfig = buildAiConfig(stored.aiConfig || {});
             const questions = extractQuestions(aiConfig);
+            const describeAncestry = (element) => {
+              const chain = [];
+              let node = element;
+              for (let depth = 0; node && depth < 6 && node.nodeType === 1; depth += 1, node = node.parentElement) {
+                const cls = typeof node.className === "string" && node.className.trim() ? `.${node.className.trim().split(/\s+/).slice(0, 2).join(".")}` : "";
+                chain.unshift(`${node.tagName.toLowerCase()}${cls}`);
+              }
+              return chain.join(" > ");
+            };
+            const allControls = [...document.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')].slice(0, 40).map((element, index) => ({
+              index,
+              tag: element.tagName,
+              type: element.getAttribute("type") || "",
+              value: normalizeText(element.value || element.innerText || "").slice(0, 20),
+              ancestry: describeAncestry(element)
+            }));
+            const htmlPreview = (element, limit) => (element?.outerHTML || "")
+              .replace(/<script[\s\S]*?<\/script>/gi, "")
+              .replace(/<style[\s\S]*?<\/style>/gi, "")
+              .replace(/\s+/g, " ")
+              .slice(0, limit);
             sendResponse({
               ok: true,
               url: location.href,
@@ -1323,8 +1397,11 @@
                 controls: question.textControls.slice(0, 4).map((control) =>
                   `${control.tagName || "?"}${control.className && typeof control.className === "string" ? "." + control.className.split(" ").filter(Boolean)[0] : ""}${control.isContentEditable ? "[CE]" : ""}`
                 ),
-                stem: question.payload.stem.slice(0, 24)
+                stem: question.payload.stem.slice(0, 24),
+                containerHtml: htmlPreview(question.container, 700),
+                parentHtml: htmlPreview(question.container.parentElement, 900)
               })),
+              allControls,
               lastFillReport,
               extractNotes: lastExtractNotes
             });

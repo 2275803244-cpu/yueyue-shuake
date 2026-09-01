@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.6.1
+// @version      3.6.3
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
 // @match        *://*/*
@@ -384,16 +384,44 @@
     return options;
   }
 
-  function editableControls(container) {
-    const direct = [...container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')]
-      .filter((element) => element.tagName !== "IFRAME");
-    const editorBodies = [...container.querySelectorAll("iframe")].flatMap((frame) => {
+  const editableFrameByBody = new WeakMap();
+  function editorBodiesIn(scope) {
+    return [...scope.querySelectorAll("iframe")].flatMap((frame) => {
       try {
         const body = frame.contentDocument?.body;
-        return body && (body.isContentEditable || body.getAttribute("contenteditable") === "true") ? [body] : [];
+        if (body && (body.isContentEditable || body.getAttribute("contenteditable") === "true")) {
+          editableFrameByBody.set(body, frame);
+          return [body];
+        }
+        return [];
       } catch { return []; }
     });
-    return [...direct, ...editorBodies].filter(isUsable);
+  }
+  function editableControls(container) {
+    const blankItems = [...container.querySelectorAll(".blankItemDiv")];
+    const controls = [];
+    const push = (element) => { if (element && !controls.includes(element)) controls.push(element); };
+    for (const blank of blankItems) {
+      const ceBodies = editorBodiesIn(blank);
+      const inputs = [...blank.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')];
+      push(ceBodies.find(isUsable) || inputs.find(isUsable) || ceBodies[0] || inputs[0]);
+    }
+    const outside = (element) => !blankItems.some((blank) => blank.contains(element));
+    if (controls.length) {
+      for (const body of editorBodiesIn(container)) {
+        if (isUsable(body) && outside(body)) push(body);
+      }
+      for (const input of container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')) {
+        if (isUsable(input) && outside(input)) push(input);
+      }
+      return controls;
+    }
+    const visible = [
+      ...editorBodiesIn(container),
+      ...container.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')
+    ].filter(isUsable);
+    if (visible.length) return visible;
+    return [...editorBodiesIn(container), ...container.querySelectorAll('textarea, input[type="text"], input:not([type])')];
   }
 
   function extractQuestions(aiConfig) {
@@ -432,24 +460,36 @@
       const type = explicitType || (options.length ? (hasCheckbox ? "multiple" : "single") : "text");
       return {
         container, optionElements: options, textControls, type,
-        payload: { question: 0, type, stem, options: options.map(({ text }) => text), ...(textControls.length > 1 ? { blanks: textControls.length } : {}) }
+        payload: { question: 0, type, stem, options: type === "text" ? [] : options.map(({ text }) => text), ...(textControls.length > 1 ? { blanks: textControls.length } : {}) }
       };
     }).filter(Boolean).map((question, index) => { question.payload.question = index; return question; });
   }
 
   function setTextControl(control, value) {
+    const dispatch = (target) => {
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+    };
     if (control.isContentEditable || control.getAttribute?.("contenteditable") === "true") {
       control.focus?.();
       control.textContent = value;
-      control.dispatchEvent(new Event("input", { bubbles: true }));
-      control.dispatchEvent(new Event("change", { bubbles: true }));
+      dispatch(control);
+      const frame = editableFrameByBody.get(control);
+      const host = frame?.closest?.(".blankItemDiv, li") || null;
+      for (const textarea of host?.querySelectorAll("textarea") || []) {
+        if (textarea.value !== value) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+          if (setter) setter.call(textarea, value); else textarea.value = value;
+          dispatch(textarea);
+        }
+      }
       return;
     }
     const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-    if (setter) setter.call(control, value); else control.value = value;
-    control.dispatchEvent(new Event("input", { bubbles: true }));
-    control.dispatchEvent(new Event("change", { bubbles: true }));
+    if (setter) setter.call(control, value);
+    else control.value = value;
+    dispatch(control);
   }
 
   let lastFillReport = [];
