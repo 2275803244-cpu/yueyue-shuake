@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.6.0
+// @version      3.6.1
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
 // @match        *://*/*
@@ -254,7 +254,7 @@
     const config = buildAiConfig();
     if (!config.endpoint || !config.model) throw new Error("请先在浮窗“AI 设置”中填写接口地址和模型");
     const enhanceMode = config.enhanceMode !== false;
-    const cacheKey = hashText(JSON.stringify({ model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, questions }));
+    const cacheKey = hashText(JSON.stringify({ v: 3, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, questions }));
     const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
     if (config.enableCache !== false) {
       const cache = store.get("answerCache", {}) || {};
@@ -397,6 +397,7 @@
   }
 
   function extractQuestions(aiConfig) {
+    lastExtractNotes = [];
     let containers;
     try { containers = [...document.querySelectorAll(aiConfig.questionSelector)]; } catch (error) { throw new Error(`题目容器选择器无效：${error.message}`); }
     const usableContainers = containers.filter(isUsable);
@@ -408,13 +409,25 @@
       const options = readOptionElements(container, aiConfig.optionSelector, explicitType);
       const textControls = editableControls(container);
       if (!options.length && !textControls.length) return null;
-      let stemElement;
-      try { stemElement = container.querySelector(aiConfig.stemSelector); } catch (error) { throw new Error(`题干选择器无效：${error.message}`); }
-      const stem = normalizeText(stemElement?.innerText || stemElement?.textContent || container.innerText)
+      let stemCandidates;
+      try { stemCandidates = [...container.querySelectorAll(aiConfig.stemSelector)]; } catch (error) { throw new Error(`题干选择器无效：${error.message}`); }
+      const pageTitle = normalizeText(document.title || "");
+      const junkStem = /^(?:章节|单元|课后|随堂|期中期末)?(?:测验|测试|作业|考试|习题)\s*\d*\s*$/;
+      const candidateTexts = stemCandidates
+        .map((element) => normalizeText(element.innerText || element.textContent || ""))
+        .filter((text) => text.length >= 5 && !junkStem.test(text) && !(pageTitle && text.length <= pageTitle.length + 2 && text.startsWith(pageTitle)));
+      const stemRaw = candidateTexts.sort((a, b) => b.length - a.length)[0] ||
+        normalizeText(stemCandidates[0]?.innerText || stemCandidates[0]?.textContent || "") ||
+        normalizeText(container.innerText);
+      const stem = stemRaw
         .replace(/^\s*\d+[、.．]\s*/, "")
         .replace(/[（(]\s*\d+(?:\.\d+)?\s*分\s*[)）]/g, "")
         .replace(/^[【\[(（]?(?:单选题|多选题|判断题|填空题|简答题)[】\])）]?\s*/g, "")
         .trim().slice(0, 4000);
+      if (!options.length && (stem.length < 5 || junkStem.test(stem) || (pageTitle && stem === pageTitle))) {
+        lastExtractNotes.push(`文本题题干识别异常（「${stem.slice(0, 24) || "空"}」），已跳过该题以防乱填`);
+        return null;
+      }
       const hasCheckbox = options.some(({ control }) => control?.type === "checkbox");
       const type = explicitType || (options.length ? (hasCheckbox ? "multiple" : "single") : "text");
       return {
@@ -440,6 +453,7 @@
   }
 
   let lastFillReport = [];
+  let lastExtractNotes = [];
   function applyAnswers(questions, answers) {
     let filledCount = 0;
     lastFillReport = [];
@@ -476,7 +490,7 @@
             .filter(Boolean);
           if (parts.length === question.textControls.length) perBlank = parts;
         }
-        const fallback = single ? [single] : [];
+        const fallback = single && question.textControls.length === 1 ? [single] : [];
         const values = perBlank.length === question.textControls.length && perBlank.some(Boolean) ? perBlank : fallback;
         if (!values.length || values.length !== question.textControls.length) {
           reason = `空数不符：题目 ${question.textControls.length} 空，AI 返回 ${perBlank.length || (single ? 1 : 0)} 份`;
@@ -1255,6 +1269,9 @@
     for (const record of diagnosis.lastFillReport || []) {
       diagnosisParts.push(`  上轮 Q${record.q + 1} 未填：${record.reason}（${record.type} 空${record.blanks} 选项${record.options}）`);
     }
+    for (const note of diagnosis.extractNotes || []) {
+      diagnosisParts.push(`  提取警告：${note}`);
+    }
     clearTimeout(diagnosisTimer);
     diagnosisTimer = setTimeout(async () => {
       diagnosisParts.push("=== 结束 ===");
@@ -1283,7 +1300,8 @@
           `${control.tagName || "?"}${control.className && typeof control.className === "string" ? "." + control.className.split(" ").filter(Boolean)[0] : ""}${control.isContentEditable ? "[CE]" : ""}`),
         stem: question.payload.stem.slice(0, 24)
       })),
-      lastFillReport
+      lastFillReport,
+      extractNotes: lastExtractNotes
     };
   }
 

@@ -176,7 +176,7 @@ async function requestAnswers(questions) {
   if (!config.endpoint || !config.model) throw new Error("请先在“AI 接口设置”中填写接口地址和模型");
 
   const enhanceMode = config.enhanceMode !== false;
-  const cacheKey = hashText(JSON.stringify({ model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, questions }));
+  const cacheKey = hashText(JSON.stringify({ v: 3, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, questions }));
   const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   if (config.enableCache !== false) {
     const cachedStore = await chrome.storage.local.get("answerCache");

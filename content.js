@@ -344,6 +344,9 @@
           for (const record of frame.lastFillReport || []) {
             lines.push(`  上轮 Q${record.q + 1} 未填：${record.reason}（${record.type} 空${record.blanks} 选项${record.options}）`);
           }
+          for (const note of frame.extractNotes || []) {
+            lines.push(`  提取警告：${note}`);
+          }
         }
         lines.push(`合计识别 ${totalQuestions} 题`);
         const text = lines.join("\n");
@@ -803,6 +806,7 @@
   }
 
   function extractQuestions(aiConfig) {
+    lastExtractNotes = [];
     let containers;
     try {
       containers = [...document.querySelectorAll(aiConfig.questionSelector)];
@@ -821,15 +825,27 @@
       const textControls = editableControls(container);
       if (!options.length && !textControls.length) return null;
 
-      let stemElement;
-      try { stemElement = container.querySelector(aiConfig.stemSelector); } catch (error) {
+      let stemCandidates;
+      try { stemCandidates = [...container.querySelectorAll(aiConfig.stemSelector)]; } catch (error) {
         throw new Error(`题干选择器无效：${error.message}`);
       }
-      const stem = normalizeText(stemElement?.innerText || stemElement?.textContent || container.innerText)
+      const pageTitle = normalizeText(document.title || "");
+      const junkStem = /^(?:章节|单元|课后|随堂|期中期末)?(?:测验|测试|作业|考试|习题)\s*\d*\s*$/;
+      const candidateTexts = stemCandidates
+        .map((element) => normalizeText(element.innerText || element.textContent || ""))
+        .filter((text) => text.length >= 5 && !junkStem.test(text) && !(pageTitle && text.length <= pageTitle.length + 2 && text.startsWith(pageTitle)));
+      const stemRaw = candidateTexts.sort((a, b) => b.length - a.length)[0] ||
+        normalizeText(stemCandidates[0]?.innerText || stemCandidates[0]?.textContent || "") ||
+        normalizeText(container.innerText);
+      const stem = stemRaw
         .replace(/^\s*\d+[、.．]\s*/, "")
         .replace(/[（(]\s*\d+(?:\.\d+)?\s*分\s*[)）]/g, "")
         .replace(/^[【\[(（]?(?:单选题|多选题|判断题|填空题|简答题)[】\])）]?\s*/g, "")
         .trim().slice(0, 4000);
+      if (!options.length && (stem.length < 5 || junkStem.test(stem) || (pageTitle && stem === pageTitle))) {
+        lastExtractNotes.push(`文本题题干识别异常（「${stem.slice(0, 24) || "空"}」），已跳过该题以防乱填；请用“复制诊断”反馈此页`);
+        return null;
+      }
       const hasCheckbox = options.some(({ control }) => control?.type === "checkbox");
       const type = explicitType || (options.length ? (hasCheckbox ? "multiple" : "single") : "text");
       return {
@@ -869,6 +885,7 @@
   }
 
   let lastFillReport = [];
+  let lastExtractNotes = [];
 
   function applyAnswers(questions, answers) {
     let filledCount = 0;
@@ -916,7 +933,7 @@
             .filter(Boolean);
           if (parts.length === question.textControls.length) perBlank = parts;
         }
-        const fallback = single ? [single] : [];
+        const fallback = single && question.textControls.length === 1 ? [single] : [];
         const values = perBlank.length === question.textControls.length && perBlank.some(Boolean) ? perBlank : fallback;
         if (!values.length || values.length !== question.textControls.length) {
           reason = `空数不符：题目 ${question.textControls.length} 空，AI 返回 ${perBlank.length || (single ? 1 : 0)} 份`;
@@ -1308,7 +1325,8 @@
                 ),
                 stem: question.payload.stem.slice(0, 24)
               })),
-              lastFillReport
+              lastFillReport,
+              extractNotes: lastExtractNotes
             });
           } catch (error) {
             sendResponse({ ok: false, error: error.message });
