@@ -2,6 +2,16 @@
   if (globalThis.__KEHANG_HELPER_CONTENT_ACTIVE__) return;
   globalThis.__KEHANG_HELPER_CONTENT_ACTIVE__ = true;
 
+  // 浮窗与自动任务只允许出现在网课站点；其他网站（用户的工作页面等）一律不注入面板、不扫任务
+  const COURSE_SITE_PATTERN = /^(?:[a-z0-9-]+\.)*(?:chaoxing\.com|edu\.cn|xuexi\.cn|zhihuishu\.com|changjietong\.com|yuketang\.cn|rainclassroom\.com|icve\.com\.cn|icourse163\.org|icourse163\.cn|xuexitong\.com|gxt\.hnvcp\.com|nodedu\.cn|sflep\.com|cnki\.net|mosoteach\.cn|mtcsun\.com|xuanyaedu\.com|classin\.cn|eelive\.cn)(?::\d+)?$/i;
+  const isCourseSite = () => {
+    try { return COURSE_SITE_PATTERN.test(new URL(location.href).hostname); } catch { return false; }
+  };
+  if (!isCourseSite()) {
+    // 非课程站点：直接退出，连消息监听都不注册（工具栏按钮点了也不会硬注入面板）
+    return;
+  }
+
   const DEFAULTS = {
     enabled: false,
     autoResume: true,
@@ -60,7 +70,7 @@
   let lastPublishedSignature = "";
   const taskMap = new Map();
   let floatingUi;
-  let floatingCustomization = { width: 300, opacity: 100, theme: "purple", compact: false };
+  let floatingCustomization = { width: 300, opacity: 100, mode: "light", compact: false };
   let runtimeStatus = {
     phase: "idle", message: "等待任务", videoCount: 0, documentCount: 0, questionCount: 0, filledCount: 0, tasks: [], updatedAt: Date.now()
   };
@@ -162,12 +172,20 @@
 
   function renderFloatingStatus(status = runtimeStatus) {
     if (!floatingUi) return;
+    const phase = status.phase || "idle";
     floatingUi.statusTitle.textContent = floatingPhaseLabel(status.phase);
     floatingUi.statusMessage.textContent = status.message || "启用后自动检测页面任务";
-    floatingUi.statusDot.className = `kh-dot ${status.phase || "idle"}`;
+    floatingUi.phaseChip.className = `phase-chip ${phase}`;
+    floatingUi.headLed.className = `led ${phase}`;
     floatingUi.videoCount.textContent = String(status.videoCount || 0);
     floatingUi.documentCount.textContent = String(status.documentCount || 0);
     floatingUi.questionCount.textContent = String(status.questionCount || 0);
+    const done = Number(status.filledCount || 0);
+    const total = Number(status.questionCount || 0);
+    floatingUi.statusNow.textContent = String(done);
+    floatingUi.statusTotal.textContent = String(total);
+    const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
+    floatingUi.progressFill.style.width = `${pct}%`;
     const activeTask = (status.tasks || []).find((task) => task.state === "running" || task.state === "error");
     floatingUi.activeTask.textContent = activeTask ? `${activeTask.label} · ${activeTask.detail || ""}` : "暂无进行中的任务";
   }
@@ -188,23 +206,23 @@
   function normalizeFloatingCustomization(value = {}) {
     const width = Math.max(260, Math.min(380, Number(value.width || 300)));
     const opacity = Math.max(70, Math.min(100, Number(value.opacity || 100)));
-    const theme = ["purple", "blue", "green", "rose"].includes(value.theme) ? value.theme : "purple";
-    return { width, opacity, theme, compact: Boolean(value.compact) };
+    const mode = value.mode === "dark" ? "dark" : "light";
+    return { width, opacity, mode, compact: Boolean(value.compact) };
   }
 
   function applyFloatingCustomization(value = floatingCustomization) {
     floatingCustomization = normalizeFloatingCustomization(value);
     if (!floatingUi) return;
-    const { width, opacity, theme, compact } = floatingCustomization;
+    const { width, opacity, mode, compact } = floatingCustomization;
     floatingUi.host.style.width = `${width}px`;
     floatingUi.panel.style.opacity = String(opacity / 100);
-    floatingUi.panel.dataset.theme = theme;
+    floatingUi.panel.dataset.mode = mode;
     floatingUi.panel.classList.toggle("compact", compact);
     floatingUi.customWidth.value = String(width);
     floatingUi.customOpacity.value = String(opacity);
     floatingUi.customOpacityValue.textContent = `${opacity}%`;
     floatingUi.customCompact.checked = compact;
-    floatingUi.themeButtons.forEach((button) => button.classList.toggle("active", button.dataset.theme === theme));
+    floatingUi.modeButtons.forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
     const rect = floatingUi.host.getBoundingClientRect();
     if (rect.right > innerWidth - 8) floatingUi.host.style.left = `${Math.max(8, innerWidth - width - 8)}px`;
   }
@@ -223,24 +241,28 @@
     shadow.innerHTML = `
       <style>
         *{box-sizing:border-box}button,input,select{font:inherit}button{cursor:pointer}
-        .panel{--accent:#6757ef;--head:#18223d;overflow:hidden;border:1px solid #dfe3ed;border-radius:16px;color:#172033;background:#fff;box-shadow:0 16px 44px rgba(22,31,55,.22);transition:opacity .2s,width .2s}.panel[data-theme="blue"]{--accent:#3182f6;--head:#152c4d}.panel[data-theme="green"]{--accent:#17a673;--head:#153b34}.panel[data-theme="rose"]{--accent:#e45778;--head:#4a2130}
-        .head{display:grid;grid-template-columns:34px 1fr auto;align-items:center;gap:9px;padding:11px 11px 10px;color:#fff;background:var(--head);cursor:grab;user-select:none;touch-action:none}.head:active{cursor:grabbing}
-        .logo{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);font-size:14px;font-weight:800}.title strong,.title small{display:block}.title strong{font-size:13px}.title small{margin-top:2px;color:#aeb8d0;font-size:9px}
-        .head-actions{display:flex;gap:5px}.icon-btn{display:grid;place-items:center;width:26px;height:26px;padding:0;border:0;border-radius:7px;color:#cbd3e6;background:#2b3754}.icon-btn:hover{background:#3a4869;color:#fff}
-        .body{padding:11px}.panel.collapsed .body{display:none}.panel.collapsed{width:220px}.panel.collapsed .collapse svg{transform:rotate(180deg)}.icon-btn svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:.2s}
-        .status{display:grid;grid-template-columns:28px 1fr;gap:8px;align-items:center;padding:9px;border-radius:11px;background:#f5f6fa}.kh-dot{position:relative;width:26px;height:26px;border:4px solid #e0e4ec;border-radius:50%}.kh-dot:after{content:'';position:absolute;inset:5px;border-radius:50%;background:#97a0b2}.kh-dot.playing:after,.kh-dot.reading:after,.kh-dot.answering:after,.kh-dot.scanning:after{background:#6757ef}.kh-dot.playing,.kh-dot.reading,.kh-dot.answering,.kh-dot.scanning{border-color:#ded9ff;animation:pulse 1.4s infinite}.kh-dot.done:after{background:#20a66a}.kh-dot.error:after{background:#e45260}
-        @keyframes pulse{50%{transform:scale(1.08)}}.status strong,.status small{display:block}.status strong{font-size:12px}.status small{max-width:225px;margin-top:2px;overflow:hidden;color:#778197;font-size:9px;text-overflow:ellipsis;white-space:nowrap}
-        .metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:9px 0}.metric{text-align:center;border-right:1px solid #e8ebf1}.metric:last-child{border:0}.metric b,.metric span{display:block}.metric b{font-size:15px}.metric span{margin-top:1px;color:#8a93a5;font-size:8px}
-        .task-line{min-height:28px;padding:7px 8px;border-radius:8px;color:#687287;background:#f7f8fb;font-size:9px;line-height:1.4}
-        .master{display:flex;align-items:center;justify-content:space-between;margin:9px 0;padding:8px 9px;border-radius:9px;background:color-mix(in srgb,var(--accent) 12%,white)}.master strong{font-size:11px}.switch{position:relative;width:34px;height:20px}.switch input{position:absolute;opacity:0}.switch i{display:block;width:34px;height:20px;border-radius:99px;background:#cbd1dc;transition:.2s}.switch i:after{content:'';position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:.2s}.switch input:checked+i{background:var(--accent)}.switch input:checked+i:after{transform:translateX(14px)}
-        .options{display:grid;grid-template-columns:1fr 1fr;gap:7px}.check{display:flex;align-items:center;gap:5px;min-height:29px;padding:6px 7px;border:1px solid #e5e8ef;border-radius:8px;color:#536076;font-size:9px}.check input{margin:0;accent-color:#6757ef}.speed{display:flex;align-items:center;justify-content:space-between}.speed select{width:64px;padding:3px;border:1px solid #d8dde7;border-radius:6px;background:#fff;font-size:9px}
-        .actions{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:9px}.action{min-height:32px;padding:7px 4px;border:0;border-radius:8px;font-size:10px;font-weight:700}.answer{color:#153f30;background:#c8f3df}.model{color:#fff;background:var(--accent)}.diag{color:#3d4450;background:#e8ebf2}
-        .customizer{margin-bottom:9px;padding:9px;border:1px solid #e4e7ef;border-radius:10px;background:#f8f9fc}.customizer[hidden]{display:none}.custom-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}.custom-head strong{font-size:10px}.reset{padding:0;border:0;color:var(--accent);background:transparent;font-size:9px}.custom-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.custom-field{display:flex;flex-direction:column;gap:4px;color:#69748a;font-size:8px}.custom-field select,.custom-field input[type=range]{width:100%}.opacity-label{display:flex;justify-content:space-between}.theme-row{display:flex;gap:6px}.theme-dot{width:20px;height:20px;padding:0;border:2px solid transparent;border-radius:50%;background:var(--dot)}.theme-dot.active{border-color:#172033;box-shadow:0 0 0 2px #fff inset}.compact-check{display:flex;align-items:center;gap:5px;color:#58647a;font-size:9px}.compact-check input{accent-color:var(--accent)}.panel.compact .metrics,.panel.compact .task-line{display:none}.panel.compact .status{margin-bottom:8px}
+        .panel{--ink:#1a1a1e;--dim:#6e6e76;--faint:#9a9aa3;--bg:#ffffff;--surface:#f7f7f8;--lift:#ffffff;--line:#e9e9ec;--track:#ededf0;--on:#1a1a1e;--knob:#ffffff;--go:#16a34a;--err:#e45260;--shadow:0 10px 32px rgba(20,20,24,.1);overflow:hidden;border:1px solid var(--line);border-radius:16px;color:var(--ink);background:var(--bg);box-shadow:var(--shadow);transition:opacity .2s,width .2s}
+        .panel[data-mode="dark"]{--ink:#f0f0f3;--dim:#a8a8b3;--faint:#6d6d78;--bg:#151517;--surface:#1c1c1f;--lift:#232327;--line:#2c2c31;--track:#26262b;--on:#f0f0f3;--knob:#151517;--go:#22c55e;--shadow:0 10px 32px rgba(0,0,0,.5)}
+        .head{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:9px;padding:11px 12px;border-bottom:1px solid var(--line);background:var(--bg);cursor:grab;user-select:none;touch-action:none}.head:active{cursor:grabbing}
+        .logo{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:var(--on);color:var(--knob);font-size:13px;font-weight:800}.title strong,.title small{display:block}.title strong{font-size:12.5px;font-weight:800;letter-spacing:.2px}.title small{margin-top:1px;color:var(--faint);font-size:9px}
+        .head-actions{display:flex;gap:2px;align-items:center}.led{width:6px;height:6px;border-radius:50%;background:var(--faint);margin:0 6px 0 2px;flex:none;transition:background .3s}.led.playing,.led.reading,.led.answering,.led.scanning{background:var(--go)}.led.done{background:var(--go)}.led.error{background:var(--err)}
+        .icon-btn{display:grid;place-items:center;width:24px;height:24px;padding:0;border:0;border-radius:6px;color:var(--dim);background:transparent;transition:background .15s,color .15s}.icon-btn:hover{background:var(--surface);color:var(--ink)}
+        .body{padding:12px}.panel.collapsed .body{display:none}.panel.collapsed{width:236px}.panel.collapsed .collapse svg{transform:rotate(180deg)}.icon-btn svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s}.body::-webkit-scrollbar{width:6px}.body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--faint) 40%,transparent);border-radius:99px}
+        .status{padding:1px 2px 11px}.status .row1{display:flex;align-items:center;justify-content:space-between}.phase-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:99px;background:var(--surface);color:var(--ink);font-size:10px;font-weight:700}.phase-chip i{width:6px;height:6px;border-radius:50%;background:var(--faint);transition:background .3s}.phase-chip.playing i,.phase-chip.reading i,.phase-chip.answering i,.phase-chip.scanning i{background:var(--go);animation:phasepulse 1.4s infinite}.phase-chip.done i{background:var(--go)}.phase-chip.error i{background:var(--err)}@keyframes phasepulse{50%{opacity:.45}}
+        .progress{height:3px;margin-top:9px;border-radius:99px;background:var(--track);overflow:hidden}.progress i{display:block;height:100%;border-radius:99px;background:var(--on);transition:width .4s ease}
+        .status strong,.status small{display:block}.status small{margin-top:8px;overflow:hidden;color:var(--faint);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.status-count{display:flex;align-items:baseline;gap:1px;color:var(--faint);font-size:10px;font-weight:700}.status-count b{color:var(--ink);font-size:11.5px;font-variant-numeric:tabular-nums}.status-count span{font-variant-numeric:tabular-nums}
+        .metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.metric{text-align:center;padding:9px 0 8px;border-right:1px solid var(--line);transition:background .15s}.metric:hover{background:var(--surface)}.metric:last-child{border:0}.metric span{display:block;color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.metric b{display:block;margin-top:3px;font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
+        .task-line{padding:0 2px 11px}.task-line .lab{color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.task-line .txt{margin-top:3px;color:var(--dim);font-size:10px;line-height:1.5}
+        .master{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:10px;background:var(--surface)}.master strong{font-size:11.5px;font-weight:700}.master small{display:block;margin-top:1px;color:var(--faint);font-size:9px}.switch{position:relative;width:36px;height:21px;flex:none}.switch input{position:absolute;opacity:0}.switch i{display:block;width:36px;height:21px;border-radius:99px;background:var(--track);transition:.2s}.switch i:after{content:'';position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:var(--knob);box-shadow:0 1px 2px rgba(0,0,0,.2);transition:.2s}.switch input:checked+i{background:var(--on)}.switch input:checked+i:after{transform:translateX(15px)}
+        .options{display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:10px}.check{display:flex;align-items:center;gap:8px;min-height:30px;padding:5px 8px;border-radius:8px;color:var(--dim);font-size:10.5px;transition:color .15s,background .15s;cursor:pointer}.check:hover{color:var(--ink);background:var(--surface)}.check input{margin:0;flex:none;width:15px;height:15px;border-radius:5px;accent-color:var(--on)}.speed{display:flex;align-items:center;justify-content:space-between}.speed select{width:70px;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);font-size:10px}
+        .actions{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:6px;margin-top:10px}.action{min-height:34px;padding:7px 4px;border:0;border-radius:9px;font-size:11px;font-weight:700;transition:background .15s,transform .12s,border-color .15s}.action:hover{background:#333339}.action:active{transform:scale(.96)}.answer{color:var(--knob);background:var(--on)}.model,.diag{color:var(--ink);background:var(--lift);border:1px solid var(--line)}.model:hover,.diag:hover{background:var(--surface);border-color:var(--dim)}
+        .customizer{margin-bottom:11px;padding:11px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.customizer[hidden]{display:none}.custom-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.custom-head strong{font-size:11px;font-weight:700}.reset{padding:0;border:0;color:var(--dim);background:transparent;font-size:10px}.reset:hover{color:var(--ink);text-decoration:underline}.custom-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.custom-field{display:flex;flex-direction:column;gap:5px;color:var(--faint);font-size:9px}.custom-field select,.custom-field input[type=range]{width:100%;accent-color:var(--on)}.custom-field select{padding:5px;border:1px solid var(--line);border-radius:8px;background:var(--lift);color:var(--ink)}.opacity-label{display:flex;justify-content:space-between}.mode-row{display:flex;gap:7px}.mode-btn{display:grid;place-items:center;width:22px;height:22px;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--lift);color:var(--dim);font-size:10.5px;transition:color .15s,border-color .15s,background .15s}.mode-btn:hover{color:var(--ink);border-color:var(--dim)}.mode-btn.active{color:var(--knob);background:var(--on);border-color:var(--on)}.compact-check{display:flex;align-items:center;gap:5px;color:var(--dim);font-size:10px;cursor:pointer}.compact-check input{accent-color:var(--on)}.panel.compact .metrics,.panel.compact .task-line{display:none}
       </style>
       <section class="panel">
         <header class="head">
           <span class="logo">玥</span><span class="title"><strong>玥玥刷客</strong><small>实时任务浮窗</small></span>
           <span class="head-actions">
+            <span class="led idle"></span>
             <button class="icon-btn customize" title="外观设置"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"></path></svg></button>
             <button class="icon-btn collapse" title="折叠"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></svg></button>
             <button class="icon-btn close" title="关闭"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>
@@ -253,12 +275,16 @@
               <label class="custom-field">窗口宽度<select class="custom-width"><option value="260">紧凑 260px</option><option value="300">标准 300px</option><option value="340">宽版 340px</option><option value="380">大号 380px</option></select></label>
               <label class="custom-field"><span class="opacity-label"><span>透明度</span><b class="opacity-value">100%</b></span><input class="custom-opacity" type="range" min="70" max="100" step="5"></label>
             </div>
-            <div class="custom-grid" style="margin-top:8px"><span class="custom-field">主题色<span class="theme-row"><button class="theme-dot" data-theme="purple" style="--dot:#6757ef"></button><button class="theme-dot" data-theme="blue" style="--dot:#3182f6"></button><button class="theme-dot" data-theme="green" style="--dot:#17a673"></button><button class="theme-dot" data-theme="rose" style="--dot:#e45778"></button></span></span><label class="compact-check"><input class="custom-compact" type="checkbox">精简模式</label></div>
+            <div class="custom-grid" style="margin-top:8px"><span class="custom-field">界面明暗<span class="mode-row"><button class="mode-btn" data-mode="light" title="浅色">☀</button><button class="mode-btn" data-mode="dark" title="深色">☾</button></span></span><label class="compact-check"><input class="custom-compact" type="checkbox">精简模式</label></div>
           </div>
-          <div class="status"><span class="kh-dot idle"></span><span><strong class="status-title">等待启动</strong><small class="status-message">启用后自动检测页面任务</small></span></div>
-          <div class="metrics"><span class="metric"><b class="video-count">0</b><span>视频</span></span><span class="metric"><b class="document-count">0</b><span>课件</span></span><span class="metric"><b class="question-count">0</b><span>题目</span></span></div>
-          <div class="task-line">暂无进行中的任务</div>
-          <div class="master"><strong>启用当前站点</strong><label class="switch"><input class="enabled" type="checkbox"><i></i></label></div>
+          <div class="status">
+            <div class="row1"><span class="phase-chip idle"><i></i><strong class="status-title">等待启动</strong></span><span class="status-count"><b class="status-now">0</b>/<span class="status-total">0</span> 题</span></div>
+            <div class="progress"><i class="progress-fill" style="width:0%"></i></div>
+            <small class="status-message">启用后自动检测页面任务</small>
+          </div>
+          <div class="metrics"><span class="metric"><span>视频</span><b class="video-count">0</b></span><span class="metric"><span>课件</span><b class="document-count">0</b></span><span class="metric"><span>题目</span><b class="question-count">0</b></span></div>
+          <div class="task-line"><div class="lab">当前任务</div><div class="txt">暂无进行中的任务</div></div>
+          <div class="master"><span><strong>启用当前站点</strong><small>开启后自动接管页面任务</small></span><label class="switch"><input class="enabled" type="checkbox"><i></i></label></div>
           <div class="options">
             <label class="check"><input class="auto-resume" type="checkbox">自动视频</label>
             <label class="check"><input class="auto-document" type="checkbox">自动课件</label>
@@ -274,10 +300,10 @@
     document.documentElement.append(host);
     const find = (selector) => shadow.querySelector(selector);
     floatingUi = {
-      host, panel: find(".panel"), head: find(".head"), statusDot: find(".kh-dot"), statusTitle: find(".status-title"), statusMessage: find(".status-message"),
-      videoCount: find(".video-count"), documentCount: find(".document-count"), questionCount: find(".question-count"), activeTask: find(".task-line"),
+      host, panel: find(".panel"), head: find(".head"), headLed: find(".led"), phaseChip: find(".phase-chip"), statusTitle: find(".status-title"), statusMessage: find(".status-message"), statusNow: find(".status-now"), statusTotal: find(".status-total"), progressFill: find(".progress-fill"),
+      videoCount: find(".video-count"), documentCount: find(".document-count"), questionCount: find(".question-count"), activeTask: find(".task-line .txt"),
       enabled: find(".enabled"), autoResume: find(".auto-resume"), autoReadDocuments: find(".auto-document"), autoAnswer: find(".auto-answer"), autoSubmit: find(".auto-submit"), autoNext: find(".auto-next"), skipCompleted: find(".skip-completed"), playbackRate: find(".rate"),
-      customizer: find(".customizer"), customWidth: find(".custom-width"), customOpacity: find(".custom-opacity"), customOpacityValue: find(".opacity-value"), customCompact: find(".custom-compact"), themeButtons: [...shadow.querySelectorAll(".theme-dot")]
+      customizer: find(".customizer"), customWidth: find(".custom-width"), customOpacity: find(".custom-opacity"), customOpacityValue: find(".opacity-value"), customCompact: find(".custom-compact"), modeButtons: [...shadow.querySelectorAll(".mode-btn")]
     };
 
     const storedUi = await chrome.storage.local.get(["floatUiPosition", "floatUiVisible", "floatUiCollapsed", "floatUiCustomization"]);
@@ -342,7 +368,9 @@
             lines.push(`  Q${question.index + 1} [${question.type}] 空${question.blanks} 选项${question.options} 控件:${question.controls.join(",") || "无"} 「${question.stem}」`);
           }
           for (const record of frame.lastFillReport || []) {
-            lines.push(`  上轮 Q${record.q + 1} 未填：${record.reason}（${record.type} 空${record.blanks} 选项${record.options}）`);
+            lines.push(record.q < 0
+              ? `  回填报告：${record.reason}`
+              : `  上轮 Q${record.q + 1} 未填：${record.reason}（${record.type} 空${record.blanks} 选项${record.options}）`);
           }
           for (const note of frame.extractNotes || []) {
             lines.push(`  提取警告：${note}`);
@@ -380,9 +408,9 @@
     floatingUi.customWidth.addEventListener("change", () => saveFloatingCustomization({ width: Number(floatingUi.customWidth.value) }));
     floatingUi.customOpacity.addEventListener("input", () => saveFloatingCustomization({ opacity: Number(floatingUi.customOpacity.value) }));
     floatingUi.customCompact.addEventListener("change", () => saveFloatingCustomization({ compact: floatingUi.customCompact.checked }));
-    floatingUi.themeButtons.forEach((button) => button.addEventListener("click", () => saveFloatingCustomization({ theme: button.dataset.theme })));
+    floatingUi.modeButtons.forEach((button) => button.addEventListener("click", () => saveFloatingCustomization({ mode: button.dataset.mode })));
     find(".reset").addEventListener("click", () => {
-      saveFloatingCustomization({ width: 300, opacity: 100, theme: "purple", compact: false });
+      saveFloatingCustomization({ width: 300, opacity: 100, mode: "light", compact: false });
       host.style.left = "auto"; host.style.top = "auto"; host.style.right = "18px"; host.style.bottom = "18px";
       chrome.storage.local.remove("floatUiPosition").catch(() => {});
     });
@@ -594,6 +622,600 @@
     });
   }
 
+  // ---------- 学习通 font-cxsecret 字体反混淆（模型无关的根治方案） ----------
+  // 学习通会给题干/选项套上动态混淆字体：DOM 里的字符是“替身”乱码字，靠 @font-face 里的字形渲染出真实汉字。
+  // 映射随页面加载随机变化，静态对照表不可靠；这里按 GlyphCopy(MIT) 的思路做动态字形识别：
+  // 解析字体 cmap → 用 canvas 把乱码字符按混淆字体渲染成 28×28 点阵 → 与真字候选的点阵指纹比对 → 得到 乱码→真字 映射。
+  // 只解码发给 AI 的文本（题干/选项原文），不改页面 DOM；映射按字体哈希缓存，同一字体只识别一次；
+  // 单字置信度不足时保留原字，宁可少解也不错解。
+  const CX_GRID_SIZE = 28;
+  const CX_FINGERPRINT_TOP = 40;
+  const CX_FINGERPRINT_ACCEPT = 0.72;
+  const CX_MIN_CONFIDENCE = 0.6;
+  const CX_MAX_OBSERVED_CHARS = 120;
+  const CX_MAX_CANDIDATES = 900;
+  const CX_MAX_STYLE_ELEMENTS = 5000;
+  const CX_CACHE_PREFIX = "cxsecret:mapping:";
+  const CX_ENSURE_THROTTLE_MS = 2000;
+  const CX_DOMAIN_CANDIDATES = "数字系统采用可以将减法运算转化为加法原码反码补码真值逻辑电路门与或非异或同或输入输出编码译码器信号二进制十进制八进制十六进制位权权值基数进位借位小数整数无符号有符号机器数表示范围溢出校验奇偶校验格雷码BCD码ASCII码触发器状态方程次态现态初态波形图所示端时钟脉冲上升沿下降沿边沿电平同步异步置位复位清零保持翻转计数器寄存器移位全加器半加器比较器选择器多路选择器数据选择器函数表达式卡诺图化简最小项最大项约束项无关项组合逻辑时序逻辑";
+  const CX_COMMON_CANDIDATES = "的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展五果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处队南给色光门即保治北造百规热领七海口东导器压志世金增争济阶油思术极交受联认六共权收证改清己美再采转更单风切打白教速花带安场身车例真务具万每目至达走积示议声报斗完类八离华名确才科张信马节话米整空元况今集温传土许步群广石记需段研界拉林律叫且究观越织装影算低持音众书布复容儿须际商非验连断深难近矿千周委素技备半办青省列习响约支般史感劳便团往酸历市克何除消构府称太准精值号率族维划选标写存候毛亲快效斯院查江型眼王按格养易置派层片始却专状育厂京识适属圆包火住调满县局照参红细引听该铁价严首底液官德随病苏失尔死讲配女黄推显谈罪神艺呢席含企望密批营项防举球英氧势告李台落木帮轮破亚师围注远字材排供河态封另施减树溶怎止案言士均武固叶鱼波视仅费紧爱左章早朝害续轻服试食充兵源判护司足某练差致板田降黑犯负击范继兴似余坚曲输修故城夫够送笔船占右财吃富春职觉汉画功巴跟虽杂飞检吸助升阳互初创抗考投坏策古径换未跑留钢曾端责站简述钱副尽帝射草冲承独令限阿宣环双请超微让控州良轴找否纪益依优顶础载倒房突坐粉敌略客袁冷胜绝析块剂测丝协诉念陈仍罗盐友洋错苦夜刑移频逐靠混母短皮终聚汽村云哪既距卫停烈央察烧迅境若印洲刻括激孔搞甚室待核校散侵吧甲游久菜味旧模湖货损预阻毫普稳乙妈植息扩银语挥酒守拿序纸医缺雨吗针刘啊急唱误训愿审附获茶鲜粮斤孩脱硫肥善龙演父渐血欢械掌歌沙刚攻谓盾讨晚粒乱燃矛乎杀药宁鲁贵钟煤读班伯香介迫句丰培握兰担弦蛋沉假穿执答乐谁顺烟缩征脸喜松脚困异免背星福买染井概慢怕磁倍祖皇促静补评翻肉践尼衣宽扬棉希伤操垂秋宜氢套督振架亮末宪庆编牛触映雷销诗座居抓裂胞呼娘景威绿晶厚盟衡鸡孙延危胶屋乡临陆顾掉呀灯岁措束耐剧玉赵跳哥季课凯胡额款绍卷齐伟蒸殖永宗苗川炉岩弱零杨奏沿露杆探滑镇饭浓航怀赶库夺伊灵税途灭赛归召鼓播盘裁险康唯录菌纯借糖盖横符私努堂域枪润幅哈竟熟虫泽脑壤碳欧遍侧寨敢彻虑斜薄庭纳弹饲伸折麦湿暗荷瓦塞床筑恶户访塔奇透梁刀旋迹卡氯遇份毒泥退洗摆灰彩卖耗夏择忙铜献硬予繁圈雪函亦抽篇阵阴丁尺追堆雄迎泛爸楼避谋吨野猪旗累偏典馆索秦脂潮爷豆忽托惊塑遗愈朱替纤粗倾尚痛楚谢奋购磨君池旁碎骨监捕弟暴割贯殊释词亡壁顿宝午尘闻揭炮残冬桥妇警综招吴付浮遭徐您摇谷赞箱隔订男吹园纷唐败宋玻巨耕坦荣闭湾键凡驻锅救恩剥凝碱齿截炼麻纺禁废盛版缓净睛昌婚涉筒嘴插岸朗庄街藏姑贸腐奴啦惯乘伙恢匀纱扎辩耳彪臣亿璃抵脉秀萨俄网舞店喷纵寸汗挂洪贺闪柬爆烯津稻墙软勇像滚厘蒙芳肯坡柱荡腿仪旅尾轧冰贡登黎削钻勒逃障氨郭峰币港伏轨亩毕擦莫刺浪秘援株健售股岛甘泡睡童铸汤阀休汇舍牧绕炸哲磷绩朋淡尖启陷柴呈徒颜泪稍忘泵蓝拖洞授镜辛壮锋贫虚弯摩泰幼廷尊窗纲弄隶疑氏宫姐震瑞怪尤琴循描膜违夹腰缘珠穷森枝竹沟催绳忆邦剩幸浆栏拥牙贮礼滤钠纹罢拍咱喊袖埃勤罚焦潜伍墨欲缝姓刊饱仿奖铝鬼丽跨默挖链扫喝袋炭污幕诸弧励梅奶洁灾舟鉴苯讼抱毁懂寒智埔寄届跃渡挑丹艰贝碰拔爹戴码梦芽熔赤渔哭敬颗奔铅仲虎稀妹乏珍申桌遵允隆螺仓魏锐晓氮兼隐碍赫拨忠肃缸牵抢博巧壳兄杜讯诚碧祥柯页巡矩悲灌龄伦票寻桂铺圣恐恰郑趣抬荒腾贴柔滴猛阔辆妻填撤储签闹扰紫砂递戏吊陶伐喂疗瓶婆抚臂摸忍虾蜡邻胸巩挤偶弃槽劲乳邓吉仁烂砖租乌舰伴瓜浅丙暂燥橡柳迷暖牌秧胆详簧踏瓷谱呆宾糊洛辉愤竞隙怒粘乃绪肩籍敏涂熙皆侦悬掘享纠醒狂锁淀恨牲霸爬赏逆玩陵祝秒浙貌役彼悉鸭趋凤晨畜辈秩卵署梯炎滩棋驱筛峡冒啥寿译浸泉帽迟硅疆贷漏稿冠嫩胁芯牢叛蚀奥鸣岭羊凭串塘绘酵融盆锡庙筹冻辅摄袭筋拒僚旱钾鸟漆沈眉疏添棒穗硝韩逼扭侨凉挺碗栽炒杯患馏劝豪辽勃鸿旦吏拜狗埋辊掩饮搬骂辞勾扣估蒋绒雾丈朵姆拟宇辑陕雕偿蓄崇剪倡厅咬驶薯刷斥番赋奉佛浇漫曼扇钙桃扶仔返俗亏腔鞋棱覆框悄叔撞骗勘旺沸孤吐孟渠屈疾妙惜仰狠胀谐抛霉桑岗嘛衰盗渗脏赖涌甜曹阅肌哩厉烃纬毅昨伪症煮叹钉搭茎笼酷偷弓锥恒杰坑鼻翼纶叙狱逮罐络棚抑膨蔬寺骤穆冶枯册尸凸绅坯牺焰轰欣晋瘦御锭锦丧旬锻垄搜扑邀亭酯迈舒脆酶闲忧酚顽羽涨卸仗陪辟惩杭姚肚捉飘漂昆欺吾郎烘汁呵饰萧雅邮迁燕撒姻赴宴烦债帐斑铃旨醇董饼雏姿拌傅腹妥揉贤拆歪葡胺丢浩徽昂垫挡览贪慰缴汪慌冯诺姜谊凶劣诬耀昏躺盈骑乔溪丛卢抹闷咨刮驾缆悟摘铒掷颇幻柄惠惨佳仇腊窝涤剑瞧堡泼葱罩霍捞胎苍滨俩捅湘砍霞邵萄疯淮遂熊粪烤宿档戈驳嫂裕徙箭捐肠撑晒辨殿莲摊搅酱屏疫哀蔡堵沫皱畅叠阁莱敲辖钩痕坝巷饿祸丘玄溜曰逻彭尝卿妨艇吞韦怨矮歇";
+  let cxSecretMapping = null;
+  let cxEnsurePromise = null;
+  let cxEnsureLastAt = 0;
+  let cxDictionaryPromise = null;
+
+  
+  async function cxStorageGet(key) {
+    try {
+      const result = await chrome.storage.local.get(key);
+      return result?.[key] ?? null;
+    } catch { return null; }
+  }
+
+  async function cxStorageSet(key, value) {
+    try { await chrome.storage.local.set({ [key]: value }); } catch {}
+  }
+
+
+  function cxBase64ToBytes(text) {
+    const clean = String(text || "").replace(/\s+/g, "");
+    let length = clean.length;
+    while (length > 0 && clean[length - 1] === "=") length -= 1;
+    const bytes = new Uint8Array(Math.floor(length * 3 / 4));
+    const decodeChar = (char) => {
+      const code = char.charCodeAt(0);
+      if (code >= 65 && code <= 90) return code - 65;
+      if (code >= 97 && code <= 122) return code - 97 + 26;
+      if (code >= 48 && code <= 57) return code - 48 + 52;
+      if (char === "+") return 62;
+      if (char === "/") return 63;
+      return -1;
+    };
+    let buffer = 0;
+    let bits = 0;
+    let outIndex = 0;
+    for (let index = 0; index < length; index += 1) {
+      const value = decodeChar(clean[index]);
+      if (value < 0) continue;
+      buffer = (buffer << 6) | value;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        if (outIndex < bytes.length) bytes[outIndex] = (buffer >> bits) & 0xff;
+        outIndex += 1;
+      }
+    }
+    return bytes;
+  }
+
+  function cxDataUriToBytes(dataUri) {
+    const commaIndex = dataUri.indexOf(",");
+    if (commaIndex < 0) throw new Error("无效的字体 data URI");
+    const meta = dataUri.slice(0, commaIndex);
+    const data = dataUri.slice(commaIndex + 1);
+    if (/;base64/i.test(meta)) return cxBase64ToBytes(data);
+    // 非 base64 的 data URI 极少见，按百分号解码取 UTF-8 字节
+    const decoded = decodeURIComponent(data);
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index) & 0xff;
+    return bytes;
+  }
+
+  async function cxHashBytes(bytes) {
+    const subtle = globalThis.crypto?.subtle;
+    if (subtle) {
+      const digest = await subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    // 无 crypto.subtle（测试环境/非安全上下文）时退化为确定性 FNV-1a，仅作缓存键
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < bytes.length; index += 1) {
+      hash ^= bytes[index];
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return `fnv-${hash.toString(16)}-${bytes.length.toString(16)}`;
+  }
+
+  function cxSplitDeclarations(block) {
+    // data URI 里就带分号，必须按括号深度切分声明，不能简单 split(";")
+    const parts = [];
+    let current = "";
+    let quote = null;
+    let depth = 0;
+    for (const char of block || "") {
+      if (quote) { current += char; if (char === quote) quote = null; continue; }
+      if (char === "'" || char === "\"") { quote = char; current += char; continue; }
+      if (char === "(") { depth += 1; current += char; continue; }
+      if (char === ")") { depth = Math.max(0, depth - 1); current += char; continue; }
+      if (char === ";" && depth === 0) { if (current.trim()) parts.push(current); current = ""; continue; }
+      current += char;
+    }
+    if (current.trim()) parts.push(current);
+    return parts;
+  }
+
+  function cxParseFontFaceCss(cssText) {
+    const faces = [];
+    const pattern = /@font-face\s*\{([\s\S]*?)\}/gi;
+    let match;
+    while ((match = pattern.exec(cssText || "")) !== null) {
+      let family = "";
+      let src = "";
+      for (const part of cxSplitDeclarations(match[1])) {
+        const colonIndex = part.indexOf(":");
+        if (colonIndex <= 0) continue;
+        const key = part.slice(0, colonIndex).trim().toLowerCase();
+        const value = part.slice(colonIndex + 1).trim();
+        if (key === "font-family" && !family) family = value.split(",")[0].trim().replace(/^['"]|['"]$/g, "");
+        if (key === "src" && !src) src = value;
+      }
+      const urlMatch = src.match(/url\(\s*(['"]?)(.*?)\1\s*\)/i);
+      if (family && urlMatch) faces.push({ family, src: urlMatch[2] });
+    }
+    return faces;
+  }
+
+  function cxDiscoverFontFaces(doc) {
+    const faces = [];
+    try {
+      for (const style of Array.from(doc.querySelectorAll("style"))) faces.push(...cxParseFontFaceCss(style.textContent || ""));
+    } catch {}
+    for (const sheet of Array.from(doc.styleSheets || [])) {
+      let rules;
+      try { rules = sheet.cssRules; } catch { continue; } // 跨域样式表会抛异常，跳过
+      for (const rule of Array.from(rules || [])) {
+        // CSSRule.FONT_FACE_RULE === 5
+        if (rule.type === 5 || /^@font-face/i.test(rule.cssText || "")) faces.push(...cxParseFontFaceCss(rule.cssText || ""));
+      }
+    }
+    const seen = new Set();
+    return faces.filter((face) => {
+      const key = `${face.family}\n${face.src}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function cxReadUInt16(bytes, offset) {
+    return (bytes[offset] << 8) | bytes[offset + 1];
+  }
+
+  function cxReadInt16(bytes, offset) {
+    const value = cxReadUInt16(bytes, offset);
+    return value & 0x8000 ? value - 0x10000 : value;
+  }
+
+  function cxReadUInt32(bytes, offset) {
+    return (((bytes[offset] << 24) >>> 0) + (bytes[offset + 1] << 16) + (bytes[offset + 2] << 8) + bytes[offset + 3]);
+  }
+
+  function cxFindSfntTable(bytes, tag) {
+    if (bytes.byteLength < 12) return null;
+    const tableCount = cxReadUInt16(bytes, 4);
+    for (let index = 0; index < tableCount; index += 1) {
+      const offset = 12 + index * 16;
+      const tableTag = String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+      if (tableTag === tag) return { offset: cxReadUInt32(bytes, offset + 8), length: cxReadUInt32(bytes, offset + 12) };
+    }
+    return null;
+  }
+
+  function cxParseCmapFormat4(bytes, offset) {
+    const codePoints = new Set();
+    const length = cxReadUInt16(bytes, offset + 2);
+    const segCount = cxReadUInt16(bytes, offset + 6) / 2;
+    const endCountOffset = offset + 14;
+    const startCountOffset = endCountOffset + segCount * 2 + 2;
+    const idDeltaOffset = startCountOffset + segCount * 2;
+    const idRangeOffsetOffset = idDeltaOffset + segCount * 2;
+
+    for (let segment = 0; segment < segCount; segment += 1) {
+      const end = cxReadUInt16(bytes, endCountOffset + segment * 2);
+      const start = cxReadUInt16(bytes, startCountOffset + segment * 2);
+      const delta = cxReadInt16(bytes, idDeltaOffset + segment * 2);
+      const rangeOffsetAddress = idRangeOffsetOffset + segment * 2;
+      const rangeOffset = cxReadUInt16(bytes, rangeOffsetAddress);
+      if (start === 0xffff && end === 0xffff) continue;
+
+      for (let codePoint = start; codePoint <= end; codePoint += 1) {
+        let glyphIndex;
+        if (rangeOffset === 0) {
+          glyphIndex = (codePoint + delta) & 0xffff;
+        } else {
+          const glyphAddress = rangeOffsetAddress + rangeOffset + (codePoint - start) * 2;
+          if (glyphAddress < offset || glyphAddress + 1 >= offset + length) continue;
+          const glyphId = cxReadUInt16(bytes, glyphAddress);
+          glyphIndex = glyphId === 0 ? 0 : (glyphId + delta) & 0xffff;
+        }
+        if (glyphIndex !== 0) codePoints.add(codePoint);
+      }
+    }
+    return codePoints;
+  }
+
+  function cxParseCmapFormat12(bytes, offset) {
+    const codePoints = new Set();
+    const groupCount = cxReadUInt32(bytes, offset + 12);
+    for (let index = 0; index < groupCount; index += 1) {
+      const groupOffset = offset + 16 + index * 12;
+      const start = cxReadUInt32(bytes, groupOffset);
+      const end = cxReadUInt32(bytes, groupOffset + 4);
+      for (let codePoint = start; codePoint <= end; codePoint += 1) codePoints.add(codePoint);
+    }
+    return codePoints;
+  }
+
+  function cxParseCmapCodePoints(bytes) {
+    const cmap = cxFindSfntTable(bytes, "cmap");
+    if (!cmap) return [];
+    const records = [];
+    const recordCount = cxReadUInt16(bytes, cmap.offset + 2);
+    for (let index = 0; index < recordCount; index += 1) {
+      const recordOffset = cmap.offset + 4 + index * 8;
+      records.push({
+        platformId: cxReadUInt16(bytes, recordOffset),
+        encodingId: cxReadUInt16(bytes, recordOffset + 2),
+        offset: cmap.offset + cxReadUInt32(bytes, recordOffset + 4)
+      });
+    }
+    const preferred = records
+      .map((record) => ({ ...record, format: cxReadUInt16(bytes, record.offset) }))
+      .sort((left, right) => {
+        const score = (record) => {
+          if (record.format === 12) return 0;
+          if (record.format === 4 && record.platformId === 3 && record.encodingId === 1) return 1;
+          if (record.format === 4) return 2;
+          return 3;
+        };
+        return score(left) - score(right);
+      });
+    for (const record of preferred) {
+      if (record.format === 12) return Array.from(cxParseCmapFormat12(bytes, record.offset)).sort((a, b) => a - b);
+      if (record.format === 4) return Array.from(cxParseCmapFormat4(bytes, record.offset)).sort((a, b) => a - b);
+    }
+    return [];
+  }
+
+  function cxTextNodesUnder(root, out) {
+    for (const child of Array.from(root.childNodes || [])) {
+      if (child.nodeType === 3) {
+        const parent = child.parentElement;
+        const blocked = parent?.closest?.("script,style,noscript,input,textarea,select,option");
+        if (parent && !blocked && child.nodeValue && child.nodeValue.trim()) out.push(child);
+      } else if (child.nodeType === 1) {
+        cxTextNodesUnder(child, out);
+      }
+    }
+    return out;
+  }
+
+  function cxObfuscatedCharCounts(doc, family, fontCodePoints) {
+    const safeFamily = String(family || "").trim();
+    const roots = new Set();
+    // 快路径：类名与字体族同名（font-cxsecret 的标准用法）
+    if (safeFamily && !/[^a-zA-Z0-9_-]/.test(safeFamily)) {
+      try { for (const element of doc.querySelectorAll(`[class~="${safeFamily}"]`)) roots.add(element); } catch {}
+    }
+    // 兜底：逐元素看计算样式里的 font-family（限制在 5000 个元素内）
+    const elements = Array.from(doc.querySelectorAll ? doc.querySelectorAll("*") : []).slice(0, CX_MAX_STYLE_ELEMENTS);
+    for (const element of elements) {
+      if (roots.has(element)) continue;
+      let computed = "";
+      try { computed = getComputedStyle(element).fontFamily || ""; } catch { continue; }
+      if (computed.split(",").some((item) => item.trim().replace(/^['"]|['"]$/g, "").toLowerCase() === safeFamily.toLowerCase())) roots.add(element);
+    }
+
+    const counts = new Map();
+    const seen = new Set();
+    for (const root of roots) {
+      for (const node of cxTextNodesUnder(root, [])) {
+        if (seen.has(node)) continue;
+        seen.add(node);
+        for (const char of node.nodeValue || "") {
+          if (/\s/.test(char)) continue;
+          if (fontCodePoints.has(char.codePointAt(0))) counts.set(char, (counts.get(char) || 0) + 1);
+        }
+      }
+    }
+    return counts;
+  }
+
+  function cxRenderGlyphMask(doc, char, fontFamily, isObfuscatedFont) {
+    // 在 128×128 画布上按指定字体渲染单字，取包围盒归一化为 28×28 点阵
+    const canvas = doc.createElement("canvas");
+    const size = 128;
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return null;
+    context.clearRect(0, 0, size, size);
+    context.fillStyle = "#000000";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.font = isObfuscatedFont
+      ? `${96}px "${fontFamily}"`
+      : `${96}px "Noto Sans SC", "Microsoft YaHei", SimSun, sans-serif`;
+    context.fillText(char, size / 2, size / 2 + 8);
+
+    const image = context.getImageData(0, 0, size, size);
+    const data = image.data;
+    let minX = size;
+    let minY = size;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        if (data[(y * size + x) * 4 + 3] > 24) {
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) return null;
+
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+    const grid = CX_GRID_SIZE;
+    const mask = new Float32Array(grid * grid);
+    const hProjection = new Float32Array(grid);
+    const vProjection = new Float32Array(grid);
+    let ink = 0;
+    for (let gy = 0; gy < grid; gy += 1) {
+      for (let gx = 0; gx < grid; gx += 1) {
+        const sampleX = Math.min(size - 1, Math.max(0, Math.round(minX + ((gx + 0.5) / grid) * width)));
+        const sampleY = Math.min(size - 1, Math.max(0, Math.round(minY + ((gy + 0.5) / grid) * height)));
+        const alpha = data[(sampleY * size + sampleX) * 4 + 3] / 255;
+        const value = alpha > 0.18 ? alpha : 0;
+        const index = gy * grid + gx;
+        mask[index] = value;
+        hProjection[gy] += value;
+        vProjection[gx] += value;
+        ink += value;
+      }
+    }
+    return { mask, hProjection, vProjection, aspect: width / Math.max(1, height), ink };
+  }
+
+  function cxCompareGlyphMasks(left, right) {
+    if (!left || !right || left.ink === 0 || right.ink === 0) return 0;
+    let pixelDiff = 0;
+    let union = 0;
+    for (let index = 0; index < left.mask.length; index += 1) {
+      const a = left.mask[index];
+      const b = right.mask[index];
+      pixelDiff += Math.abs(a - b);
+      union += Math.max(a, b);
+    }
+    let projectionDiff = 0;
+    let projectionUnion = 0;
+    for (let index = 0; index < CX_GRID_SIZE; index += 1) {
+      projectionDiff += Math.abs(left.hProjection[index] - right.hProjection[index]);
+      projectionDiff += Math.abs(left.vProjection[index] - right.vProjection[index]);
+      projectionUnion += Math.max(left.hProjection[index], right.hProjection[index]);
+      projectionUnion += Math.max(left.vProjection[index], right.vProjection[index]);
+    }
+    const pixelScore = 1 - pixelDiff / Math.max(1, union);
+    const projectionScore = 1 - projectionDiff / Math.max(1, projectionUnion);
+    const aspectScore = Math.max(0, 1 - Math.abs(left.aspect - right.aspect) / 1.5);
+    const inkScore = Math.max(0, 1 - Math.abs(left.ink - right.ink) / Math.max(left.ink, right.ink));
+    return pixelScore * 0.58 + projectionScore * 0.25 + aspectScore * 0.1 + inkScore * 0.07;
+  }
+
+  function cxHexToBits(hex, bitCount) {
+    const bits = new Uint8Array(bitCount);
+    let bitIndex = 0;
+    for (const nibble of String(hex || "")) {
+      const value = Number.parseInt(nibble, 16);
+      if (!Number.isFinite(value)) continue;
+      for (let shift = 3; shift >= 0 && bitIndex < bitCount; shift -= 1) {
+        bits[bitIndex] = (value >> shift) & 1;
+        bitIndex += 1;
+      }
+    }
+    return bits;
+  }
+
+  function cxGlyphMaskToFingerprint(glyphMask) {
+    if (!glyphMask || glyphMask.ink === 0) return null;
+    const bitCount = CX_GRID_SIZE * CX_GRID_SIZE;
+    const bits = new Uint8Array(bitCount);
+    const projectionX = new Array(CX_GRID_SIZE).fill(0);
+    const projectionY = new Array(CX_GRID_SIZE).fill(0);
+    let ink = 0;
+    for (let gy = 0; gy < CX_GRID_SIZE; gy += 1) {
+      for (let gx = 0; gx < CX_GRID_SIZE; gx += 1) {
+        const index = gy * CX_GRID_SIZE + gx;
+        const bit = glyphMask.mask[index] > 0.18 ? 1 : 0;
+        bits[index] = bit;
+        projectionX[gx] += bit;
+        projectionY[gy] += bit;
+        ink += bit;
+      }
+    }
+    return { bits, projectionX, projectionY, aspect: glyphMask.aspect, ink };
+  }
+
+  function cxCompareGlyphFingerprints(left, right) {
+    if (!left || !right || left.ink === 0 || right.ink === 0) return 0;
+    let intersection = 0;
+    let union = 0;
+    for (let index = 0; index < left.bits.length; index += 1) {
+      const a = left.bits[index];
+      const b = right.bits[index];
+      if (a || b) {
+        union += 1;
+        if (a && b) intersection += 1;
+      }
+    }
+    let projectionDiff = 0;
+    let projectionUnion = 0;
+    for (let index = 0; index < CX_GRID_SIZE; index += 1) {
+      projectionDiff += Math.abs((left.projectionX[index] || 0) - (right.projectionX[index] || 0));
+      projectionDiff += Math.abs((left.projectionY[index] || 0) - (right.projectionY[index] || 0));
+      projectionUnion += Math.max(left.projectionX[index] || 0, right.projectionX[index] || 0);
+      projectionUnion += Math.max(left.projectionY[index] || 0, right.projectionY[index] || 0);
+    }
+    const shapeScore = intersection / Math.max(1, union);
+    const projectionScore = 1 - projectionDiff / Math.max(1, projectionUnion);
+    const aspectScore = Math.max(0, 1 - Math.abs(left.aspect - right.aspect) / 1.5);
+    const inkScore = Math.max(0, 1 - Math.abs(left.ink - right.ink) / Math.max(left.ink, right.ink));
+    return shapeScore * 0.62 + projectionScore * 0.22 + aspectScore * 0.1 + inkScore * 0.06;
+  }
+
+  function cxLoadFingerprintDictionary() {
+    if (!cxDictionaryPromise) {
+      cxDictionaryPromise = (async () => {
+        // 字典只随扩展打包；userscript 环境没有 getURL，返回 null 走 canvas 兜底
+        if (typeof chrome === "undefined" || typeof chrome.runtime?.getURL !== "function") return null;
+        const response = await fetch(chrome.runtime.getURL("data/glyph-fingerprints-noto-sans-sc.json"));
+        if (!response.ok) throw new Error(`字典加载失败：${response.status}`);
+        const payload = await response.json();
+        const gridSize = payload.gridSize || CX_GRID_SIZE;
+        const entries = (payload.entries || [])
+          .filter((entry) => entry.char && entry.grid)
+          .map((entry) => ({
+            char: entry.char,
+            aspect: Number(entry.aspect) || 0,
+            ink: Number(entry.ink) || 0,
+            bits: cxHexToBits(entry.grid, gridSize * gridSize),
+            projectionX: entry.projectionX || [],
+            projectionY: entry.projectionY || []
+          }));
+        return { gridSize, entries };
+      })().catch((error) => {
+        console.warn("[玥玥刷客] 字形指纹字典不可用，改用 canvas 兜底识别：", error);
+        cxDictionaryPromise = null;
+        return null;
+      });
+    }
+    return cxDictionaryPromise;
+  }
+
+  function cxRankDictionaryCandidates(sourceFingerprint, dictionary, excludedCodePoints) {
+    if (!sourceFingerprint || !dictionary || dictionary.gridSize !== CX_GRID_SIZE) return [];
+    return dictionary.entries
+      .filter((entry) => !excludedCodePoints.has(entry.char.codePointAt(0)))
+      .map((entry) => ({ char: entry.char, fingerprintScore: cxCompareGlyphFingerprints(sourceFingerprint, entry) }))
+      .sort((left, right) => right.fingerprintScore - left.fingerprintScore)
+      .slice(0, CX_FINGERPRINT_TOP);
+  }
+
+  function cxCollectCandidateChars(doc, excludedCodePoints) {
+    // 真字候选：领域常用字 + 页面正文出现过的字 + 通用高频字；排除混淆字体 cmap 覆盖的字
+    const candidates = new Set();
+    const add = (char) => {
+      const codePoint = char.codePointAt(0);
+      if (codePoint >= 0x4e00 && codePoint <= 0x9fff && !excludedCodePoints.has(codePoint)) candidates.add(char);
+    };
+    for (const char of CX_DOMAIN_CANDIDATES) add(char);
+    let pageText = "";
+    try { pageText = doc.body ? doc.body.innerText || "" : ""; } catch {}
+    for (const char of pageText) add(char);
+    for (const char of CX_COMMON_CANDIDATES) add(char);
+    return Array.from(candidates).slice(0, CX_MAX_CANDIDATES);
+  }
+
+  async function cxRecognizeFont(doc, family, fontCodePoints, observedChars, cached) {
+    const mapping = { ...(cached?.mapping || {}) };
+    const confidence = { ...(cached?.confidence || {}) };
+    const todo = observedChars.filter((char) => !Object.prototype.hasOwnProperty.call(mapping, char));
+    if (todo.length) {
+      try { if (doc.fonts?.ready) await doc.fonts.ready; } catch {}
+      const dictionary = await cxLoadFingerprintDictionary();
+      const fallbackCandidates = cxCollectCandidateChars(doc, fontCodePoints);
+      const candidateMaskCache = new Map();
+      const candidateMask = (char) => {
+        if (!candidateMaskCache.has(char)) candidateMaskCache.set(char, cxRenderGlyphMask(doc, char, family, false));
+        return candidateMaskCache.get(char);
+      };
+      for (const sourceChar of todo) {
+        const sourceMask = cxRenderGlyphMask(doc, sourceChar, family, true);
+        if (!sourceMask) continue;
+        const sourceFingerprint = dictionary ? cxGlyphMaskToFingerprint(sourceMask) : null;
+        const fingerprintRanked = dictionary ? cxRankDictionaryCandidates(sourceFingerprint, dictionary, fontCodePoints) : [];
+        let ranked = (fingerprintRanked.length ? fingerprintRanked.map((item) => item.char) : fallbackCandidates)
+          .map((char) => ({ char, score: cxCompareGlyphMasks(sourceMask, candidateMask(char)) }))
+          .sort((left, right) => right.score - left.score);
+        // 字典初筛的候选画布复比都不达标时，回退全量候选再比一遍
+        if (fingerprintRanked.length && (!ranked[0] || ranked[0].score < CX_FINGERPRINT_ACCEPT)) {
+          const fallbackRanked = fallbackCandidates
+            .map((char) => ({ char, score: cxCompareGlyphMasks(sourceMask, candidateMask(char)) }))
+            .sort((left, right) => right.score - left.score);
+          if ((fallbackRanked[0]?.score || 0) > (ranked[0]?.score || 0)) ranked = fallbackRanked;
+        }
+        const best = ranked[0];
+        if (!best || best.score < CX_MIN_CONFIDENCE) continue; // 识别不出就保留原字，宁可少解也不错解
+        mapping[sourceChar] = best.char;
+        confidence[sourceChar] = Number(best.score.toFixed(4));
+      }
+    }
+    return { mapping, confidence, recognizedCount: Object.keys(mapping).length };
+  }
+
+  async function cxEnsureDecoding(force = false) {
+    if (cxSecretMapping && !force && Date.now() - cxEnsureLastAt < CX_ENSURE_THROTTLE_MS) return cxSecretMapping;
+    if (cxEnsurePromise) return cxEnsurePromise;
+    cxEnsureLastAt = Date.now();
+    // 识别链路里任何一步卡死（canvas/字体解析/storage）都不许拖死答题：30 秒拿不到映射就按原文发送
+    cxEnsurePromise = Promise.race([
+      (async () => {
+        try {
+          const faces = cxDiscoverFontFaces(document).filter((face) => /^data:/i.test(face.src));
+          if (!faces.length) { cxSecretMapping = null; return null; }
+          const merged = {};
+          for (const face of faces) {
+            const bytes = cxDataUriToBytes(face.src);
+            const fontHash = await cxHashBytes(bytes);
+            const cacheKey = `${CX_CACHE_PREFIX}${fontHash}`;
+            const cached = await cxStorageGet(cacheKey);
+            const fontCodePoints = new Set(cxParseCmapCodePoints(bytes));
+            if (!fontCodePoints.size) continue;
+            const counts = cxObfuscatedCharCounts(document, face.family, fontCodePoints);
+            const observedChars = Array.from(counts.keys()).slice(0, CX_MAX_OBSERVED_CHARS);
+            const missing = observedChars.filter((char) => !Object.prototype.hasOwnProperty.call(cached?.mapping || {}, char));
+            const recognition = (missing.length || !cached)
+              ? await cxRecognizeFont(document, face.family, fontCodePoints, observedChars, cached)
+              : cached;
+            if (recognition?.mapping && Object.keys(recognition.mapping).length) {
+              if (missing.length) await cxStorageSet(cacheKey, { mapping: recognition.mapping, confidence: recognition.confidence || {}, updatedAt: Date.now() });
+              Object.assign(merged, recognition.mapping);
+            }
+          }
+          cxSecretMapping = Object.keys(merged).length ? merged : null;
+          if (cxSecretMapping) console.info("[玥玥刷客] cxsecret 字体已解码：", Object.keys(cxSecretMapping).length, "个字符映射");
+          return cxSecretMapping;
+        } catch (error) {
+          console.warn("[玥玥刷客] cxsecret 字体解码失败，本次按原文发送：", error);
+          return null;
+        }
+      })(),
+      new Promise((resolve) => setTimeout(() => { console.warn("[玥玥刷客] cxsecret 字体解码超时，本次按原文发送"); resolve(null); }, 30000))
+    ]).finally(() => { cxEnsurePromise = null; });
+    return cxEnsurePromise;
+  }
+
+  function decodeCxSecretText(text) {
+    if (typeof text !== "string" || !text || !cxSecretMapping) return text;
+    let decoded = "";
+    let changed = false;
+    for (const char of text) {
+      if (Object.prototype.hasOwnProperty.call(cxSecretMapping, char)) {
+        decoded += cxSecretMapping[char];
+        changed = true;
+      } else {
+        decoded += char;
+      }
+    }
+    return changed ? decoded : text;
+  }
+
+  function cxTestSetMapping(mapping) {
+    cxSecretMapping = mapping || null;
+  }
+
   function normalizeText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
   }
@@ -779,16 +1401,31 @@
       throw new Error(`选项选择器无效：${error.message}`);
     }
 
+    // 选择器会把同一选项的 li/span/a 多层都命中（如 li.before-after + span.num_option + a.after），
+    // 逐层去重会留下 3 倍元素导致索引错位、点击落到无 onclick 的装饰层上。
+    // 改为按“可点击宿主”归并：同一宿主内的所有命中元素合并为一个选项。
+    const hostOf = (element) => {
+      if (element.matches('input[type="radio"], input[type="checkbox"]')) return element;
+      const clickable = element.closest?.('[onclick], li[role="radio"], li[role="checkbox"], li[role="option"], [aria-checked]');
+      return clickable || element;
+    };
+    const byHost = new Map();
+    for (const candidate of candidates) {
+      const host = hostOf(candidate);
+      if (!byHost.has(host)) byHost.set(host, []);
+      byHost.get(host).push(candidate);
+    }
+
     const seenControls = new Set();
     const seenText = new Set();
     const options = [];
-    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
-      const element = candidates[candidateIndex];
-      const control = element.matches('input[type="radio"], input[type="checkbox"]')
-        ? element
-        : element.querySelector('input[type="radio"], input[type="checkbox"]');
-      const ariaLabel = element.getAttribute("aria-label") || element.closest("[aria-label]")?.getAttribute("aria-label") || "";
-      let text = normalizeAnswerText(element.innerText || element.textContent || control?.value || ariaLabel);
+    for (const [host, elements] of byHost) {
+      const control = host.matches?.('input[type="radio"], input[type="checkbox"]')
+        ? host
+        : host.querySelector?.('input[type="radio"], input[type="checkbox"]');
+      const ariaLabel = host.getAttribute?.("aria-label") || host.closest?.("[aria-label]")?.getAttribute("aria-label") || "";
+      const rawText = elements.map((element) => element.innerText || element.textContent || "").filter(Boolean).sort((a, b) => b.length - a.length)[0] || "";
+      let text = decodeCxSecretText(normalizeAnswerText(rawText || control?.value || ariaLabel));
       if (/^第\s*\d+\s*空[:：]?$/.test(text)) continue;
       if (questionType === "judgement") {
         const probe = `${text} ${ariaLabel}`;
@@ -798,7 +1435,7 @@
       if (!text || (control && seenControls.has(control)) || (!control && seenText.has(text))) continue;
       if (control) seenControls.add(control);
       else seenText.add(text);
-      options.push({ element, control, text: text.slice(0, 1000) });
+      options.push({ element: host, control, text: text.slice(0, 1000) });
     }
     return options;
   }
@@ -847,8 +1484,9 @@
     return [...editorBodiesIn(container), ...container.querySelectorAll('textarea, input[type="text"], input:not([type])')];
   }
 
-  function extractQuestions(aiConfig) {
+  async function extractQuestions(aiConfig) {
     lastExtractNotes = [];
+    await cxEnsureDecoding();
     let containers;
     try {
       containers = [...document.querySelectorAll(aiConfig.questionSelector)];
@@ -879,7 +1517,7 @@
       const stemRaw = candidateTexts.sort((a, b) => b.length - a.length)[0] ||
         normalizeText(stemCandidates[0]?.innerText || stemCandidates[0]?.textContent || "") ||
         normalizeText(container.innerText);
-      const stem = stemRaw
+      const stem = decodeCxSecretText(stemRaw)
         .replace(/^\s*\d+[、.．]\s*/, "")
         .replace(/[（(]\s*\d+(?:\.\d+)?\s*分\s*[)）]/g, "")
         .replace(/^[【\[(（]?(?:单选题|多选题|判断题|填空题|简答题)[】\])）]?\s*/g, "")
@@ -916,7 +1554,18 @@
     };
     if (control.isContentEditable || control.getAttribute?.("contenteditable") === "true") {
       control.focus?.();
-      control.textContent = value;
+      // 优先走 execCommand 输入管线：UEditor 这类富文本只认自己的事件流，直接改 DOM 会被它按内部空模型回滚
+      let inserted = false;
+      try {
+        const doc = control.ownerDocument;
+        const selection = doc.getSelection();
+        const range = doc.createRange();
+        range.selectNodeContents(control);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        inserted = doc.execCommand("insertText", false, value);
+      } catch {}
+      if (!inserted) control.textContent = value;
       dispatch(control);
       // UEditor 双写：把答案同步到同一空/同题的原生 textarea，兼容平台只读其一
       const frame = editableFrameByBody.get(control);
@@ -928,13 +1577,14 @@
           dispatch(textarea);
         }
       }
-      return;
+      return (control.textContent || "").trim() === value.trim();
     }
     const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
     if (setter) setter.call(control, value);
     else control.value = value;
     dispatch(control);
+    return String(control.value ?? "").trim() === value.trim();
   }
 
   let lastFillReport = [];
@@ -971,35 +1621,36 @@
             } else if (shouldSelect && control.checked) {
               changed = true;
             }
+          } else if (shouldSelect && ariaSelected) {
+            // 已选中的选项重复 click 会被 addMultipleChoice 取反，直接计为已填
+            changed = true;
           } else if (shouldSelect || (question.type === "multiple" && ariaSelected && !shouldSelect)) {
             element.click();
             changed = true;
           }
         });
       } else if (question.textControls.length) {
-        let perBlank = Array.isArray(answer.textAnswers) ? answer.textAnswers.map((value) => String(value ?? "").trim()) : [];
-        const single = typeof answer.textAnswer === "string" ? answer.textAnswer.trim() : "";
-        if (perBlank.length !== question.textControls.length && question.textControls.length > 1 && single) {
-          const parts = single
-            .split(/[/／；;，,、]|和|与/)
-            .map((part) => part.replace(/^第\s*\d+\s*空[:：]?\s*/, "").trim())
-            .filter(Boolean);
-          if (parts.length === question.textControls.length) perBlank = parts;
-        }
-        const fallback = single && question.textControls.length === 1 ? [single] : [];
-        const values = perBlank.length === question.textControls.length && perBlank.some(Boolean) ? perBlank : fallback;
+        const values = perBlankValuesFor(question, answer);
+        const wrapper = question.container?.closest?.(".singleQuesId") || question.container;
+        const hasExisting = wrapper ? blankTextIn(wrapper) : question.textControls.some((control) => controlTextIn(control));
         if (!values.length || values.length !== question.textControls.length) {
-          reason = `空数不符：题目 ${question.textControls.length} 空，AI 返回 ${perBlank.length || (single ? 1 : 0)} 份`;
+          reason = `空数不符：题目 ${question.textControls.length} 空，AI 返回 ${Array.isArray(answer.textAnswers) ? answer.textAnswers.length : (answer.textAnswer ? 1 : 0)} 份`;
+          if (hasExisting) { filledCount += 1; continue; } // AI 空答案不清空页面已有作答
+        } else if (!values.some(Boolean) && hasExisting) {
+          filledCount += 1; // AI 返回空串时同样保留已有作答
+          continue;
         }
         let filledBlanks = 0;
         question.textControls.forEach((control, index) => {
           const value = values[index];
-          if (value) {
-            setTextControl(control, value);
+          if (value && setTextControl(control, value)) {
             filledBlanks += 1;
+          } else if (value) {
+            lastFillReport.push({ q: questionIndex, ok: false, reason: `第${index + 1}空写入后回读为空` });
           }
         });
         changed = question.textControls.length === 1 ? filledBlanks > 0 : filledBlanks === question.textControls.length;
+        if (!changed && filledBlanks > 0) reason = reason || `部分空写入失败：${filledBlanks}/${question.textControls.length}`;
       }
 
       if (changed) filledCount += 1;
@@ -1010,6 +1661,89 @@
       });
     }
     return filledCount;
+  }
+
+  function perBlankValuesFor(question, answer) {
+    let perBlank = Array.isArray(answer.textAnswers) ? answer.textAnswers.map((value) => String(value ?? "").trim()) : [];
+    const single = typeof answer.textAnswer === "string" ? answer.textAnswer.trim() : "";
+    if (perBlank.length !== question.textControls.length && question.textControls.length > 1 && single) {
+      const parts = single
+        .split(/[/／；;，,、]|和|与/)
+        .map((part) => part.replace(/^第\s*\d+\s*空[:：]?\s*/, "").trim())
+        .filter(Boolean);
+      if (parts.length === question.textControls.length) perBlank = parts;
+    }
+    // 题面有多个空但平台只提供一个答题框（如简答题）时，合并 AI 的多份答案填入，避免整题被空数不符跳过
+    if (perBlank.length > question.textControls.length && question.textControls.length >= 1) {
+      const merged = perBlank.slice(0, question.textControls.length - 1);
+      merged.push(perBlank.slice(question.textControls.length - 1).join("和"));
+      perBlank = merged;
+    }
+    const fallback = single && question.textControls.length === 1 ? [single] : [];
+    return perBlank.length === question.textControls.length && perBlank.some(Boolean) ? perBlank : fallback;
+  }
+
+  // 文本题在孤立世界里的写入会被 UEditor/页面按内部模型回滚——把空值交给页面主世界重写
+  function collectTextPayload(questions, answers) {
+    const payload = [];
+    for (const answer of answers || []) {
+      const question = questions[Number(answer?.question)];
+      if (!question || question.type !== "text" || !question.textControls.length) continue;
+      const values = perBlankValuesFor(question, answer);
+      if (values.length !== question.textControls.length || !values.some(Boolean)) continue;
+      const qid = question.container?.closest?.(".singleQuesId")?.getAttribute("data") || "";
+      if (!qid) continue;
+      payload.push({ qid, blanks: values });
+    }
+    return payload;
+  }
+
+  function blankTextIn(item) {
+    const textarea = item.querySelector?.("textarea");
+    const value = String(textarea?.value || "").trim();
+    if (value) return value;
+    // 主世界写入只改 UEditor 的 InpDIV（提交时才同步回 textarea），回读必须覆盖它
+    for (const holder of item.querySelectorAll?.("[id^='inpDiv']") || []) {
+      const text = String(holder.textContent || "").trim();
+      if (text) return text;
+    }
+    for (const frame of item.querySelectorAll?.("iframe") || []) {
+      try {
+        const text = String(frame.contentDocument?.body?.textContent || "").trim();
+        if (text) return text;
+      } catch {}
+    }
+    return "";
+  }
+
+  function controlTextIn(control) {
+    if (!control) return "";
+    if (control.isContentEditable || control.tagName === "BODY") return String(control.textContent || "").trim();
+    return String(control.value ?? control.textContent ?? "").trim();
+  }
+
+  // 终审：不信任 applyAnswers 的“写入成功”，直接按平台会提交的真实状态重新读题
+  function auditQuestions(questions) {
+    const report = [];
+    let filledCount = 0;
+    questions.forEach((question, index) => {
+      const isText = question.type === "text" || (!question.optionElements.length && question.textControls.length);
+      if (isText && question.textControls.length) {
+        const blanks = [...question.container.querySelectorAll(".blankItemDiv, ul.Zy_ulTk > li")]
+          .filter((item) => item.querySelector("textarea") || item.querySelector("iframe"));
+        const source = blanks.length ? blanks.map(blankTextIn) : question.textControls.map(controlTextIn);
+        const filled = source.filter(Boolean).length;
+        const changed = source.length === 1 ? filled > 0 : filled === source.length;
+        if (changed) filledCount += 1;
+        else report.push({ q: index, type: question.type, blanks: source.length, options: 0, reason: `回读为空：仅 ${filled}/${source.length} 空有值` });
+      } else if (question.optionElements.length) {
+        const highlighted = [...question.container.querySelectorAll("span.check_answer, span.check_answer_dx")]
+          .some((span) => span.getAttribute("data"));
+        if (highlighted) filledCount += 1;
+        else report.push({ q: index, type: question.type, blanks: question.textControls.length, options: question.optionElements.length, reason: "选项高亮缺失，平台不会记录此题" });
+      }
+    });
+    return { filledCount, report };
   }
 
   function isBlockingVideoQuiz(question) {
@@ -1106,7 +1840,7 @@
     if (quizInFlight) return { ok: false, error: "AI 正在答题，请稍候" };
     const stored = await chrome.storage.local.get("aiConfig");
     const aiConfig = buildAiConfig(stored.aiConfig || {});
-    const questions = extractQuestions(aiConfig);
+    const questions = await extractQuestions(aiConfig);
     if (!questions.length) {
       if (!suppressEmptyError) publishStatus({ phase: "error", questionCount: 0, message: "当前页面没有识别到题目，请检查页面适配设置" });
       return { ok: false, error: "当前页面没有识别到题目，请检查题目选择器" };
@@ -1147,10 +1881,48 @@
     try {
       const response = await chrome.runtime.sendMessage({ type: "AI_REQUEST", questions: payload });
       if (!response?.ok) throw new Error(response?.error || "AI 接口没有返回结果");
-      const filledCount = applyAnswers(questions, response.answers);
+      const localFilled = applyAnswers(questions, response.answers);
+      let filledCount = localFilled;
+      // 学习通新版作业页：孤立世界的文本写入会被页面回滚，把空值交给主世界重写，再按实时 DOM 终审
+      const chaoxingWorkPage = questions.some((question) => question.container?.closest?.(".singleQuesId"));
+      if (chaoxingWorkPage) {
+        const textPayload = collectTextPayload(questions, response.answers);
+        const fillNotes = [];
+        questions.forEach((question, index) => {
+          if (question.type !== "text" || !question.textControls.length) return;
+          const qid = question.container?.closest?.(".singleQuesId")?.getAttribute("data") || "";
+          if (textPayload.some((item) => item.qid === qid)) return;
+          const answer = (response.answers || []).find((item) => Number(item?.question) === index);
+          fillNotes.push(answer
+            ? `Q${index + 1} 跳过回填：题目 ${question.textControls.length} 空，AI 返回 textAnswers=${JSON.stringify(answer.textAnswers ?? null)} textAnswer=${JSON.stringify(String(answer.textAnswer || "").slice(0, 40))}`
+            : `Q${index + 1} 跳过回填：AI 没有返回这题的答案`);
+        });
+        if (textPayload.length) {
+          try {
+            const fillResult = await chrome.runtime.sendMessage({ type: "CHAOXING_FILL_TEXT", payload: textPayload });
+            if (!fillResult?.ok) fillNotes.push(`主世界回填失败：${fillResult?.error || "未知原因"}`);
+            for (const record of fillResult?.results || []) {
+              const note = record.ok ? `写入「${String(record.value || "").slice(0, 20)}」` : (record.reason || "失败");
+              fillNotes.push(`qid ${record.qid} 第${Number(record.blank) + 1}空主世界${record.skipped ? "已有值跳过" : note}`);
+            }
+          } catch (error) {
+            fillNotes.push(`主世界回填异常：${error.message}`);
+          }
+        } else {
+          fillNotes.push("没有可回填的文本题（AI 未返回空值或空数不符）");
+        }
+        const audit = auditQuestions(questions);
+        filledCount = audit.filledCount;
+        lastFillReport = [
+          ...fillNotes.map((reason) => ({ q: -1, ok: false, reason })),
+          ...audit.report
+        ];
+      }
       lastQuizFingerprint = fingerprint;
 
-      const shouldSubmit = settings.autoSubmit || blockingVideoQuiz;
+      // 交卷是最终动作：普通章节测验是否提交完全由用户的「普通题提交」开关决定；
+      // 视频内弹题（blockingVideoQuiz）不归该开关管，作答完立即提交，避免弹题悬空卡住视频。
+      const shouldSubmit = blockingVideoQuiz ? true : settings.autoSubmit === true;
       let submission = { ok: false };
       if (shouldSubmit && filledCount === questions.length) {
         submission = await submitAnsweredQuestions(aiConfig, questions, blockingVideoQuiz, taskId);
@@ -1257,7 +2029,7 @@
       if (handleIncompleteTaskDialog()) return;
       const stored = await chrome.storage.local.get("aiConfig");
       const aiConfig = buildAiConfig(stored.aiConfig || {});
-      const questions = extractQuestions(aiConfig);
+      const questions = await extractQuestions(aiConfig);
       const videos = [...document.querySelectorAll("video")];
       const readers = findDocumentReaders();
       const blockingVideoQuiz = questions.some(isBlockingVideoQuiz);
@@ -1361,10 +2133,10 @@
     if (!message || !["APPLY_SETTINGS", "RESCAN", "ANSWER_NOW", "GET_STATUS", "TOGGLE_FLOAT", "DIAGNOSE_NOW"].includes(message.type)) return;
     loadSettings().then(() => {
       if (message.type === "DIAGNOSE_NOW") {
-        chrome.storage.local.get("aiConfig").then((stored) => {
+        chrome.storage.local.get("aiConfig").then(async (stored) => {
           try {
             const aiConfig = buildAiConfig(stored.aiConfig || {});
-            const questions = extractQuestions(aiConfig);
+            const questions = await extractQuestions(aiConfig);
             const describeAncestry = (element) => {
               const chain = [];
               let node = element;
@@ -1421,10 +2193,10 @@
         return;
       }
       if (message.type === "GET_STATUS") {
-        chrome.storage.local.get("aiConfig").then((stored) => {
+        chrome.storage.local.get("aiConfig").then(async (stored) => {
           try {
             const aiConfig = buildAiConfig(stored.aiConfig || {});
-            const questionCount = extractQuestions(aiConfig).length;
+            const questionCount = (await extractQuestions(aiConfig)).length;
             runtimeStatus = {
               ...runtimeStatus,
               videoCount: document.querySelectorAll("video").length,

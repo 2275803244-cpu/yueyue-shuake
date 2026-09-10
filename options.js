@@ -8,6 +8,7 @@ const DEFAULT_AI_CONFIG = {
   extraHeaders: "{}",
   enableCache: true,
   enhanceMode: true,
+  webSearch: false,
   requestTimeoutMs: 30000,
   retryCount: 2,
   retryDelayMs: 1200,
@@ -135,6 +136,11 @@ document.querySelector("#test").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
+});
+
+document.querySelector("#reloadExt").addEventListener("click", () => {
+  setStatus("正在重载扩展…");
+  chrome.runtime.reload();
 });
 
 initialize().catch((error) => setStatus(`读取设置失败：${error.message}`, true));

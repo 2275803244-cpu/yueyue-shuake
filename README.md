@@ -4,7 +4,7 @@
 
 ## 下载
 
-- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.6.0.zip](release/yueyue-shuake-v3.6.0.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.7.9.zip](release/yueyue-shuake-v3.7.9.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
 - 用户脚本版（脚本猫 / 油猴）：[userscript/yueyue-shuake.user.js](userscript/yueyue-shuake.user.js)，安装说明见 [userscript/README.md](userscript/README.md)。
 
 ## 安装
@@ -23,6 +23,14 @@
 5. 回到课程页面，点击浮窗的“立即答题”；确认识别正确后，再按需打开“自动答题”。
 
 默认不会自动提交答案。“普通题提交”打开后，仅当本轮识别出的每道题都成功填写时才提交。学习通章节测验会调用页面原生 `btnBlueSubmit()`，随后调用 `submitCheckTimes()` 完成确认；失败时浮窗会显示具体原因，不再把“已填写”误报成“已提交”。
+
+## 3.7.0 学习通字体反混淆（font-cxsecret 解码）
+
+- 学习通给题干/选项套动态混淆字体：DOM 文本是被替换的乱码字，页面上看起来正常只是因为字形被换过。此前把乱码原文发给 AI，导致最混淆的题目（如「加工中心的____实现刀具自动交换」）AI 根本读不懂。
+- 现在提取题目时自动解码：解析页面 @font-face 中 data-URI 字体的 cmap，用 canvas 把乱码字符按混淆字体渲染成 28×28 点阵，再与内置 NotoSansSC 字形指纹字典（2049 字）比对得到「乱码→真字」映射。题干与选项都解码后再发给 AI，选项回配（choiceTexts）两端用同一套解码文本。
+- 映射随页面字体随机变化，因此按字形动态识别而非静态对照表；同一字体按其内容哈希缓存到本地，同字体只识别一次。识别置信度不足的字符保留原字，宁少解不误解。
+- 对所有 AI 服务商生效（模型无关）；扩展版内置指纹字典（`data/glyph-fingerprints-noto-sans-sc.json`，约 840KB），字典不可用时自动退回页面候选字 canvas 兜底比对。
+- 字形指纹字典与识别思路源自 [GlyphCopy](https://github.com/AxisTech/glyphcopy)（MIT License）。
 
 ## 3.6.3 学习通新版填空题适配
 

@@ -8,6 +8,7 @@ const DEFAULT_AI_CONFIG = {
   extraHeaders: "{}",
   enableCache: true,
   enhanceMode: true,
+  webSearch: false,
   requestTimeoutMs: 30000,
   retryCount: 2,
   retryDelayMs: 1200,
@@ -26,6 +27,12 @@ async function toggleFloatingWindow(tabId) {
 
 chrome.action.onClicked.addListener((tab) => {
   if (!tab.id || !/^https?:/i.test(tab.url || "")) return;
+  // 只在网课站点启用浮窗硬注入，其他页面点图标不做任何事
+  try {
+    const host = new URL(tab.url).hostname;
+    const courseSite = /^(?:[a-z0-9-]+\.)*(?:chaoxing\.com|edu\.cn|xuexi\.cn|zhihuishu\.com|changjietong\.com|yuketang\.cn|rainclassroom\.com|icve\.com\.cn|icourse163\.org|icourse163\.cn|xuexitong\.com|gxt\.hnvcp\.com|nodedu\.cn|sflep\.com|cnki\.net|mosoteach\.cn|mtcsun\.com|xuanyaedu\.com|classin\.cn|eelive\.cn)(?::\d+)?$/i.test(host);
+    if (!courseSite) return;
+  } catch { return; }
   toggleFloatingWindow(tab.id).catch(() => {});
 });
 
@@ -69,14 +76,28 @@ function aggregateFrameStatuses(statuses) {
   };
 }
 
+// frame 可能已被回收或脚本失联：sendMessage 会永远不回，必须带超时，否则答题/诊断整体挂死
+const FRAME_MSG_TIMEOUT_MS = 20000;
+function sendToFrame(tabId, message, frameId) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, error: `frame#${frameId} ${FRAME_MSG_TIMEOUT_MS / 1000} 秒未响应` });
+    }, FRAME_MSG_TIMEOUT_MS);
+    chrome.tabs.sendMessage(tabId, message, { frameId }).then(
+      (response) => { if (settled) return; settled = true; clearTimeout(timer); resolve(response ?? { ok: false, error: "frame 无响应" }); },
+      (error) => { if (settled) return; settled = true; clearTimeout(timer); resolve({ ok: false, error: error.message }); }
+    );
+  });
+}
+
 async function answerAllFrames(tabId) {
   const frames = await chrome.webNavigation.getAllFrames({ tabId });
   const results = await Promise.all((frames || []).map(async ({ frameId }) => {
-    try {
-      return { frameId, response: await chrome.tabs.sendMessage(tabId, { type: "ANSWER_NOW", allFrames: true }, { frameId }) };
-    } catch (error) {
-      return { frameId, response: { ok: false, error: error.message } };
-    }
+    const response = await sendToFrame(tabId, { type: "ANSWER_NOW", allFrames: true }, frameId);
+    return { frameId, response };
   }));
   const answered = results.filter((item) => item.response?.answerResult?.questionCount > 0);
   return {
@@ -91,11 +112,8 @@ async function answerAllFrames(tabId) {
 async function diagnoseAllFrames(tabId) {
   const frames = await chrome.webNavigation.getAllFrames({ tabId });
   const results = await Promise.all((frames || []).map(async ({ frameId }) => {
-    try {
-      return { frameId, response: await chrome.tabs.sendMessage(tabId, { type: "DIAGNOSE_NOW" }, { frameId }) };
-    } catch (error) {
-      return { frameId, response: { ok: false, error: error.message } };
-    }
+    const response = await sendToFrame(tabId, { type: "DIAGNOSE_NOW" }, frameId);
+    return { frameId, response };
   }));
   return { ok: true, questionCount: results.reduce((sum, item) => sum + (item.response?.questions?.length || 0), 0), results };
 }
@@ -129,14 +147,39 @@ function parseJsonReply(content) {
 }
 
 function answerSchemaRules() {
-  return '严格输出：{"answers":[{"question":0,"choices":[0],"choiceTexts":["选项原文"],"textAnswers":[""],"textAnswer":""}]}。选择题必须同时给出 choices 和 choiceTexts，并确保二者指向同一选项；多空填空题（题目带 blanks 数量）必须在 textAnswers 数组里按空顺序逐空给出答案，禁止把多个空的答案用顿号、斜杠合并进一个字符串；单空文本题填写 textAnswer。判断题将“对/正确/True/√”视为正确，将“错/错误/False/×”视为错误。';
+  return '严格输出：{"answers":[{"question":0,"choices":[0],"choiceTexts":["选项原文"],"textAnswers":[""],"textAnswer":""}]}。选择题必须同时给出 choices 和 choiceTexts，并确保二者指向同一选项；多空填空题（题目带 blanks 数量）必须在 textAnswers 数组里按空顺序逐空给出答案，禁止把多个空的答案用顿号、斜杠合并进一个字符串；单空文本题填写 textAnswer。判断题将“对/正确/True/√”视为正确，将“错/错误/False/×”视为错误。否定题特别规则：题干含“不属于/不包括/不是/不正确/错误的是/不包括/无关的是/不必需”等否定词时，先逐项判断该项是否符合肯定表述，再选出唯一不符合的那一项，严禁把“最典型/最核心”的肯定项当答案。部分课程平台会用自定义字体把题面文字替换成形近乱码（如“浹工中心”实为“加工中心”、“嵃心”实为“中心”、“崐”实为“工”）：请按专业课程语境推断还原真实文字再作答；每道题必须给出答案，禁止因乱码返回空字符串。';
+}
+
+function webSearchHint() {
+  return "你已启用联网搜索。作答前优先检索在线题库（百度题库、学科网、学习通/超星题目库、百科等）：能检索到原题时直接采用题库标准答案；检索不到时再自行推理。题面文字可能被课程平台的反爬字体混淆成生僻乱码，把乱码字符当作被替换的占位字，只取可读关键词、数字和标准号（如 ISO 10791、PLC、24）组句搜索。";
+}
+
+function webSearchParams(config, endpoint) {
+  if (config.webSearch === false) return {};
+  if (endpoint.includes("bigmodel.cn")) {
+    return { tools: [{ type: "web_search", web_search: { enable: true, search_result: true } }] };
+  }
+  if (endpoint.includes("moonshot.cn")) {
+    return { tools: [{ type: "builtin_function", builtin_function: { name: "$web_search" } }] };
+  }
+  if (endpoint.includes("dashscope.aliyuncs.com")) {
+    return { enable_search: true };
+  }
+  return {};
 }
 
 async function chatCompletion(config, endpoint, headers, messages) {
   const maxAttempts = Math.max(1, Math.min(6, Number(config.retryCount ?? 2) + 1));
-  const timeoutMs = Math.max(5000, Math.min(120000, Number(config.requestTimeoutMs || 30000)));
+  const timeoutMs = Math.max(5000, Math.min(180000, Number(config.requestTimeoutMs || 30000)));
   const retryDelayMs = Math.max(200, Math.min(10000, Number(config.retryDelayMs || 1200)));
-  const body = JSON.stringify({ model: config.model, temperature: 0.1, messages });
+  const search = webSearchParams(config, endpoint);
+  const body = JSON.stringify({
+    model: config.model,
+    temperature: 0.1,
+    messages,
+    ...(search.tools ? { tools: search.tools } : {}),
+    ...(search.enable_search ? { enable_search: true } : {})
+  });
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const controller = new AbortController();
@@ -165,10 +208,86 @@ async function chatCompletion(config, endpoint, headers, messages) {
   throw lastError || new Error("AI 请求失败");
 }
 
-function pickAnswer(parsed, questionIndex) {
-  if (!parsed || !Array.isArray(parsed.answers)) throw new Error("AI 返回 JSON 缺少 answers 数组");
-  return parsed.answers.find((item) => Number(item?.question) === questionIndex) || parsed.answers[0] || null;
-}
+  function pickAnswer(parsed, questionIndex) {
+    if (!parsed || !Array.isArray(parsed.answers)) throw new Error("AI 返回 JSON 缺少 answers 数组");
+    return parsed.answers.find((item) => Number(item?.question) === questionIndex) || parsed.answers[0] || null;
+  }
+
+  // 答案是否真正可用：选择题要有 choices；文本题 textAnswers/textAnswer 至少一个非空
+  function answerIsUsable(question, answer) {
+    if (!answer) return false;
+    if (question.type === "text") {
+      const joined = (Array.isArray(answer.textAnswers) ? answer.textAnswers.join("") : "") + String(answer.textAnswer || "");
+      if (!joined.trim()) return false;
+      // 页面标题/导航文案被模型当答案抄回来的，一律视为未答（会触发补问重取）
+      if (/^(?:章节|单元|课后|随堂|期中期末)(?:测验|测试|作业|考试|习题)\s*\d*$/.test(joined.trim())) return false;
+      return true;
+    }
+    return Array.isArray(answer.choices) && answer.choices.length > 0;
+  }
+
+  // 模型不一定按 schema 把文本答案写进 textAnswer/textAnswers：从常见杂牌字段里捞回来
+  function harvestTextAnswer(question, answer) {
+    if (!answer || question.type !== "text") return answer;
+    const joined = (Array.isArray(answer.textAnswers) ? answer.textAnswers.join("") : "") + String(answer.textAnswer || "");
+    if (joined.trim()) return answer;
+    const blanks = Number(question.blanks || 1) || 1;
+    for (const key of ["answer", "answers", "text", "content", "result", "答案"]) {
+      const raw = answer[key];
+      if (typeof raw === "string" && raw.trim()) return { ...answer, textAnswer: raw };
+      if (Array.isArray(raw) && raw.length) {
+        const parts = raw.map((item) => (typeof item === "string" ? item : String(item?.answer ?? item?.text ?? ""))).filter((item) => item.trim());
+        if (!parts.length) continue;
+        if (blanks > 1 && parts.length === blanks) return { ...answer, textAnswers: parts };
+        return { ...answer, textAnswer: parts.join("和") };
+      }
+    }
+    return answer;
+  }
+
+  // 模型偶尔会漏答某道文本题（返回空串）：把这些题单独再问一次，用补问结果覆盖
+  async function retryUnanswered(config, endpoint, headers, questions, answers, pickByIndex) {
+    const answersByIndex = new Map(answers.map((item) => [Number(item?.question), item]).filter(([, item]) => item));
+    const pending = [];
+    questions.forEach((question, index) => {
+      const existing = answersByIndex.get(index);
+      // error 是 enhance 工作流接住的网络/解析错误，模型未必真答不了：值得再补问一次
+      if (!answerIsUsable(question, existing)) pending.push({ question, index });
+    });
+    if (!pending.length) return { answers, refilled: 0 };
+    const schemaRules = answerSchemaRules();
+    const searchHint = config.webSearch === false ? "" : webSearchHint();
+    const retrySystem = `${config.systemPrompt || ""}\n${schemaRules}${searchHint}只输出 JSON，不要解释。以下题目上一轮没有作答（答案为空），这次必须每题给出非空答案。`;
+    const results = await Promise.all(pending.map(async ({ question, index }) => {
+      try {
+        const parsed = await chatCompletion(config, endpoint, headers, [
+          { role: "system", content: retrySystem },
+          {
+            role: "user", content: `请回答这道题：\n${JSON.stringify({ ...question, question: index })}\n\n这道题是文本题（填空/简答），最终答案文本必须写入 textAnswer 字段且非空，禁止留空。答案措辞必须贴合题干空缺处的语法搭配，并优先采用题干或题目上下文中出现过的规范术语（例如空缺前是“实现……功能的核心执行机构”时，应填该机构的规范全称，而不是它的某个部件名）。`
+          }
+        ]);
+        console.info(`[玥玥刷客] 空题补问 Q${index} 原始返回：`, JSON.stringify(parsed).slice(0, 400));
+        const answer = harvestTextAnswer(question, pickByIndex ? pickByIndex(parsed, index) : (parsed?.answers?.find((item) => Number(item?.question) === index) || parsed?.answers?.[0] || null));
+        return answerIsUsable(question, answer) ? { ...answer, question: index } : null;
+      } catch (error) {
+        console.info(`[玥玥刷客] 空题补问 Q${index} 失败：`, error.message);
+        return null;
+      }
+    }));
+    const merged = answers.slice();
+    let refilled = 0;
+    pending.forEach(({ index }, position) => {
+      const replacement = results[position];
+      if (replacement) {
+        const existing = merged.findIndex((item) => Number(item?.question) === index);
+        if (existing >= 0) merged[existing] = replacement;
+        else merged.push(replacement);
+        refilled += 1;
+      }
+    });
+    return { answers: merged, refilled };
+  }
+
 
 async function requestAnswers(questions) {
   const stored = await chrome.storage.local.get("aiConfig");
@@ -176,13 +295,19 @@ async function requestAnswers(questions) {
   if (!config.endpoint || !config.model) throw new Error("请先在“AI 接口设置”中填写接口地址和模型");
 
   const enhanceMode = config.enhanceMode !== false;
-  const cacheKey = hashText(JSON.stringify({ v: 3, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, questions }));
+  // v5：否定题规则与选项归并修复上线，旧版本缓存（含乱码时代“章节测验”等垃圾答案）全部换键作废
+  const cacheKey = hashText(JSON.stringify({ v: 5, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, webSearch: config.webSearch !== false, questions }));
   const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   if (config.enableCache !== false) {
     const cachedStore = await chrome.storage.local.get("answerCache");
     const cached = cachedStore.answerCache?.[cacheKey];
     if (cached?.answers && Array.isArray(cached.answers) && Date.now() - (cached.at || 0) < CACHE_TTL_MS) {
-      return { answers: cached.answers, cached: true, attempts: 0 };
+      // 缓存命中必须逐题可用：空答案、error 条目、“章节测验”类导航文本都算没答，放行重新请求
+      const usable = questions.every((question) => {
+        const answer = cached.answers.find((item) => Number(item?.question) === Number(question.question));
+        return answerIsUsable(question, answer);
+      });
+      if (usable) return { answers: cached.answers, cached: true, attempts: 0 };
     }
   }
 
@@ -206,20 +331,22 @@ async function requestAnswers(questions) {
   }
 
   const schemaRules = answerSchemaRules();
+  const searchHint = config.webSearch === false ? "" : webSearchHint();
   let answers;
   let attempts = 0;
 
   if (!enhanceMode) {
     const parsed = await chatCompletion(config, endpoint, headers, [
-      { role: "system", content: `${config.systemPrompt || ""}\n${schemaRules}只依据题干与选项字面信息作答，不确定时选择最可能的选项。` },
+      { role: "system", content: `${config.systemPrompt || ""}\n${schemaRules}${searchHint}只依据题干与选项字面信息作答，不确定时选择最可能的选项。` },
       { role: "user", content: `请逐题回答并复核以下题目：\n${JSON.stringify(questions)}` }
     ]);
     attempts = 1;
     if (!Array.isArray(parsed.answers)) throw new Error("AI 返回 JSON 缺少 answers 数组");
     answers = parsed.answers;
   } else {
-    const solveSystem = `${config.systemPrompt || ""}\n${schemaRules}只依据题干与选项字面信息作答，不确定时选择最可能的选项；多选题逐个选项独立判断，拿不准的选项不选；判断题警惕“都、一定、必须、所有”等绝对化表述。`;
-    const verifySystem = `你是阅卷审核员。先独立解答题目，再与候选答案比对：一致就原样返回候选答案，不一致就返回你复核后的最终答案。${schemaRules}只输出 JSON，不要解释。`;
+    const solveSystem = `${config.systemPrompt || ""}\n${schemaRules}${searchHint}只依据题干与选项字面信息作答，不确定时选择最可能的选项；多选题逐个选项独立判断，拿不准的选项不选；判断题警惕“都、一定、必须、所有”等绝对化表述。`;
+    const isNegative = (question) => /不属于|不包括|不正确|不是|无关|不必需|不包括|错误的是|不对/.test(String(question?.stem || ""));
+    const verifySystem = `你是阅卷审核员。先独立解答题目，再与候选答案比对：一致就原样返回候选答案，不一致就返回你复核后的最终答案。题干含“不属于/不正确/不是”等否定词时必须用排除法复核：逐项标记“符合肯定表述”与“不符合”，最终答案只能是唯一“不符合”的那项，候选答案若选了最典型、最核心的肯定项，判定为错误并纠正。${schemaRules}只输出 JSON，不要解释。`;
     const results = new Array(questions.length).fill(null);
     let cursor = 0;
     const worker = async () => {
@@ -255,6 +382,15 @@ async function requestAnswers(questions) {
     }
     answers = results.filter(Boolean);
   }
+
+  // 主轮答案先做一次形状归一：模型把答案写进杂牌字段时直接捞回，避免不必要的补问
+  answers = answers.map((item) => {
+    const question = questions[Number(item?.question)];
+    return question && question.type === "text" ? harvestTextAnswer(question, item) : item;
+  });
+
+  ({ answers, refilled } = await retryUnanswered(config, endpoint, headers, questions, answers, pickAnswer));
+  if (refilled) console.info(`[玥玥刷客] 空答案补问：${refilled} 题重新作答`);
 
   if (config.enableCache !== false) {
     const cachedStore = await chrome.storage.local.get("answerCache");
@@ -301,45 +437,233 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === "CHAOXING_SUBMIT" && sender.tab?.id) {
+  if (message?.type === "CHAOXING_FILL_TEXT" && sender.tab?.id) {
+    // 在题目所在的 frame 主世界里执行：与 UEditor 同一 JS 域，插入走页面真实事件流，才能不被回滚
+    const fillExecutor = async (payload) => {
+      const norm = (value) => String(value ?? "").trim();
+      const setNative = (textarea, value) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        if (setter) setter.call(textarea, value); else textarea.value = value;
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      const blankTextOf = (item) => {
+        const value = norm(item.querySelector("textarea")?.value);
+        if (value) return value;
+        for (const frame of item.querySelectorAll("iframe")) {
+          try {
+            const text = norm(frame.contentDocument?.body?.textContent);
+            if (text) return text;
+          } catch {}
+        }
+        return "";
+      };
+      const ueOf = (blank) => {
+        try {
+          const UE = window.UE;
+          if (UE && UE.instants) {
+            for (const inst of Object.values(UE.instants)) {
+              if (inst && (blank.contains(inst.container) || (inst.iframe && blank.contains(inst.iframe)))) return inst;
+            }
+          }
+        } catch {}
+        return null;
+      };
+      const results = [];
+      for (const item of payload) {
+        const qid = String(item.qid || "");
+        const host = qid ? document.querySelector(`.singleQuesId[data="${qid}"]`) : null;
+        if (!host) { results.push({ qid, ok: false, reason: "找不到题目节点" }); continue; }
+        const blanks = [...host.querySelectorAll(".blankItemDiv, ul.Zy_ulTk > li")]
+          .filter((node) => node.querySelector("textarea") || node.querySelector("iframe"));
+        (item.blanks || []).forEach((value, index) => {
+          const text = norm(value);
+          const blank = blanks[index];
+          if (!blank || !text) { results.push({ qid, blank: index, ok: false, reason: blank ? "空答案为空" : "空位节点缺失" }); return; }
+          let ok = false;
+          const existing = norm(blankTextOf(blank));
+          if (existing) { results.push({ qid, blank: index, ok: true, skipped: true, value: existing.slice(0, 50) }); return; }
+          const inst = ueOf(blank);
+          if (inst?.setContent) {
+            try { inst.setContent(text); inst.sync?.(); ok = norm(blankTextOf(blank)) === text; } catch {}
+          }
+          if (!ok) {
+            for (const frame of blank.querySelectorAll("iframe")) {
+              try {
+                const doc = frame.contentDocument;
+                const body = doc?.body;
+                if (body && (body.isContentEditable || body.getAttribute("contenteditable") === "true")) {
+                  body.focus();
+                  const sel = doc.getSelection();
+                  const range = doc.createRange();
+                  range.selectNodeContents(body);
+                  sel?.removeAllRanges();
+                  sel?.addRange(range);
+                  doc.execCommand("insertText", false, text);
+                  if (norm(body.textContent) === text) { ok = true; break; }
+                }
+              } catch {}
+            }
+          }
+          const textarea = blank.querySelector("textarea");
+          if (textarea && norm(textarea.value) !== text) setNative(textarea, text);
+          ok = ok || norm(blankTextOf(blank)) === text;
+          results.push({ qid, blank: index, ok, value: norm(blankTextOf(blank)).slice(0, 50) });
+        });
+      }
+      return { ok: true, results };
+    };
     chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
       world: "MAIN",
-      func: async () => {
-        const usable = (element) => {
-          if (!element || element.disabled || element.getAttribute("aria-disabled") === "true") return false;
-          const style = getComputedStyle(element);
-          return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+      func: fillExecutor,
+      args: [Array.isArray(message.payload) ? message.payload : []]
+    }).then((results) => sendResponse(results?.[0]?.result || { ok: false, error: "主世界回填没有返回结果" }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "CHAOXING_SUBMIT" && sender.tab?.id) {
+    // 提交前在页面主世界做最终核验与补偿：以学习通自己维护的 .check_answer 高亮为选中态事实源，
+    // 空白的填空/简答尝试补写（原生 setter + UEditor execCommand），仍为空的选项题只警告不拦截。
+    const submitExecutor = async () => {
+      const collectDocs = () => {
+        const docs = [document];
+        const walk = (root, depth) => {
+          if (depth > 6 || !root) return;
+          for (const frame of root.querySelectorAll("iframe")) {
+            try {
+              const doc = frame.contentDocument;
+              if (doc && !docs.includes(doc)) { docs.push(doc); walk(doc, depth + 1); }
+            } catch {}
+          }
         };
-        const findTextButton = (pattern) => [...document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]")].find((element) => {
-          const label = String(element.innerText || element.textContent || element.value || "").trim().replace(/\s+/g, " ");
-          return pattern.test(label) && usable(element);
-        });
-        let method = "";
-        const originalAlert = globalThis.alert;
-        globalThis.alert = () => {};
-        try {
-          if (typeof globalThis.btnBlueSubmit === "function") {
-            await Promise.resolve(globalThis.btnBlueSubmit());
-            method = "btnBlueSubmit";
-          } else {
-            const submit = document.querySelector(".btnBlueSubmit, [onclick*='btnBlueSubmit'], [onclick*='submitAnswer'], .submit-answer, button[type=submit]") ||
-              findTextButton(/^(提交|提交答案|完成|交卷)$/);
-            if (!usable(submit)) return { ok: false, error: "没有找到学习通提交入口" };
-            submit.click();
-            method = "button";
+        walk(document, 0);
+        return docs;
+      };
+      const usable = (element) => {
+        if (!element || element.disabled || element.getAttribute("aria-disabled") === "true") return false;
+        const style = getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+      };
+      const findTextButton = (pattern) => [...document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]")].find((element) => {
+        const label = String(element.innerText || element.textContent || element.value || "").trim().replace(/\s+/g, " ");
+        return pattern.test(label) && usable(element);
+      });
+      const blankTextOf = (item) => {
+        const ta = item.querySelector("textarea");
+        const value = String(ta?.value || "").trim();
+        if (value) return value;
+        for (const frame of item.querySelectorAll("iframe")) {
+          try {
+            const text = String(frame.contentDocument?.body?.textContent || "").trim();
+            if (text) return text;
+          } catch {}
+        }
+        return "";
+      };
+      const setNative = (textarea, value) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+        if (setter) setter.call(textarea, value); else textarea.value = value;
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
+        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      const setRich = (blankDiv, value) => {
+        for (const frame of blankDiv.querySelectorAll("iframe")) {
+          try {
+            const doc = frame.contentDocument;
+            const body = doc?.body;
+            if (body && (body.isContentEditable || body.getAttribute("contenteditable") === "true")) {
+              body.focus();
+              const sel = doc.getSelection();
+              const range = doc.createRange();
+              range.selectNodeContents(body);
+              sel?.removeAllRanges();
+              sel?.addRange(range);
+              if (doc.execCommand("insertText", false, value) && String(body.textContent || "").trim()) return true;
+            }
+          } catch {}
+        }
+        return false;
+      };
+      const docs = collectDocs();
+      const plans = [];
+      let choiceQuestions = 0;
+      for (const doc of docs) {
+        if (!doc.querySelector(".TiMu,.newTiMu")) continue;
+        const items = [];
+        for (const q of doc.querySelectorAll(".TiMu,.newTiMu")) {
+          const qtype = String(q.getAttribute("data") || "");
+          const isChoice = qtype === "0" || qtype === "1";
+          const checked = [...q.querySelectorAll("span.check_answer, span.check_answer_dx")].some((s) => s.getAttribute("data"));
+          const blanks = [...q.querySelectorAll(".blankItemDiv, .Zy_ulTk > li")];
+          const filledTexts = blanks.map(blankTextOf).filter(Boolean);
+          if (isChoice) choiceQuestions += 1;
+          items.push({ q, isChoice, checked, blanks, filledTexts });
+        }
+        plans.push({ doc, items });
+      }
+      if (!plans.length) return { ok: false, error: "没有找到可提交的学习通题目页" };
+      // 补偿回填：复用题内其它空的已有值不可靠，只有页面窗口里可恢复的才补；这里仅对「有 InpDIV 但全空」的空跳过
+      let fixedBlanks = 0;
+      for (const { doc, items } of plans) {
+        for (const item of items) {
+          for (const blank of item.blanks) {
+            if (blankTextOf(blank)) continue;
+            const ta = blank.querySelector("textarea");
+            const value = item.filledTexts.find((text) =>
+              ![...item.blanks].slice(0, [...item.blanks].indexOf(blank)).some((b) => blankTextOf(b) === text)) || item.filledTexts[0];
+            if (!value) continue;
+            if (ta) { setNative(ta, value); fixedBlanks += 1; }
+            else if (setRich(blank, value)) fixedBlanks += 1;
           }
-          await new Promise((resolve) => setTimeout(resolve, 1200));
-          if (typeof globalThis.submitCheckTimes === "function") {
-            await Promise.resolve(globalThis.submitCheckTimes());
-          } else {
-            findTextButton(/^(确定|确认|确认提交)$/)?.click();
-          }
-          return { ok: true, method };
-        } finally {
-          globalThis.alert = originalAlert;
         }
       }
+      let unansweredChoice = 0;
+      let unansweredText = 0;
+      for (const { items } of plans) {
+        for (const item of items) {
+          if (item.isChoice && !item.checked) unansweredChoice += 1;
+          if (!item.isChoice && item.blanks.length && !item.filledTexts.length) unansweredText += 1;
+        }
+      }
+      const originalAlert = globalThis.alert;
+      globalThis.alert = () => {};
+      let method = "";
+      try {
+        if (typeof globalThis.btnBlueSubmit === "function") {
+          await Promise.resolve(globalThis.btnBlueSubmit());
+          method = "btnBlueSubmit";
+        } else {
+          const submit = document.querySelector(".btnBlueSubmit, [onclick*='btnBlueSubmit'], [onclick*='submitAnswer'], .submit-answer, button[type=submit]") ||
+            findTextButton(/^(提交|提交答案|完成|交卷)$/);
+          if (!usable(submit)) return { ok: false, error: "没有找到学习通提交入口" };
+          submit.click();
+          method = "button";
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        if (typeof globalThis.submitCheckTimes === "function") {
+          await Promise.resolve(globalThis.submitCheckTimes());
+        } else {
+          findTextButton(/^(确定|确认|确认提交)$/)?.click();
+        }
+        const notes = [];
+        if (unansweredChoice) notes.push(`${unansweredChoice} 道选择/多选题未选中`);
+        if (unansweredText) notes.push(`${unansweredText} 道填空/简答题为空`);
+        return {
+          ok: true, method, fixedBlanks,
+          totalQuestions: plans.reduce((sum, p) => sum + p.items.length, 0),
+          choiceQuestions, unansweredChoice, unansweredText,
+          note: notes.length ? `注意：${notes.join("，")}，本次提交可能扣分` : ""
+        };
+      } finally {
+        globalThis.alert = originalAlert;
+      }
+    };
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
+      world: "MAIN",
+      func: submitExecutor
     }).then((results) => sendResponse(results?.[0]?.result || { ok: false, error: "学习通提交没有返回结果" }))
       .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;

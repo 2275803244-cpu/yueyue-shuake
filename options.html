@@ -37,6 +37,7 @@
           <label>失败重试次数<input id="retryCount" type="number" min="0" max="5"></label>
           <label>重试间隔（毫秒）<input id="retryDelayMs" type="number" min="200" max="10000" step="100"></label>
         </div>
+        <label class="checkbox"><input id="webSearch" type="checkbox">联网搜索（答题前先联网检索题库，显著提升准确率；支持智谱 GLM、通义百炼、Kimi，其余接口自动忽略）</label>
         <label class="checkbox"><input id="enhanceMode" type="checkbox">高准确率模式（逐题请求并由 AI 二次复核，更准但更慢、更耗额度）</label>
         <label class="checkbox"><input id="enableCache" type="checkbox">启用答案缓存（相同题目 7 天内直接复用，不重复请求）</label>
       </section>
@@ -58,6 +59,7 @@
       <div class="actions">
         <button id="save">保存设置</button>
         <button id="test" class="secondary">测试 AI 接口</button>
+        <button id="reloadExt" class="secondary" title="开发调试用：热重载扩展（含后台脚本），重载后需刷新已打开的课程页">重载扩展</button>
       </div>
       <p id="status" aria-live="polite"></p>
     </main>

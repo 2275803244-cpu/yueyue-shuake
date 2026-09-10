@@ -17,6 +17,7 @@
 - 设置面板内嵌在浮窗（“AI 设置”按钮），不再依赖扩展独立设置页。
 - 跨 frame 协调使用 `postMessage`；学习通 `PCount.next`/`btnBlueSubmit` 通过 `unsafeWindow` 在页面上下文调用。
 - 数据保存在脚本管理器存储（`GM_setValue`），按站点（origin）隔离；卸载脚本即清除。
+- 学习通 font-cxsecret 字体反混淆同样内置（3.7.0 起）：题干/选项先解码再发给 AI。扩展版额外打包 NotoSansSC 字形指纹字典（约 840KB）加速识别；用户脚本版无内置字典，自动用页面候选字 canvas 兜底比对，首次识别会稍慢约 1 秒。字形识别思路源自 [GlyphCopy](https://github.com/AxisTech/glyphcopy)（MIT License）。
 
 ## 排错
 
