@@ -318,6 +318,15 @@ async function requestAnswers(questions) {
     throw new Error("AI 接口地址不是有效 URL");
   }
 
+  // v3.8.0 权限收窄：manifest 不再预置 <all_urls>，发请求前必须确认已授权该接口域名
+  const origin = new URL(endpoint).origin + "/*";
+  const granted = await chrome.permissions.contains({ origins: [origin] });
+  if (!granted) {
+    const error = new Error(`尚未授权访问 ${new URL(endpoint).hostname}：请在设置页点「测试 AI 接口」或「保存设置」授权`);
+    error.permissionNeeded = origin;
+    throw error;
+  }
+
   let extraHeaders;
   try {
     extraHeaders = JSON.parse(config.extraHeaders || "{}");
@@ -700,7 +709,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "AI_REQUEST") {
     requestAnswers(message.questions)
       .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+      .catch((error) => {
+        // 权限收窄后未授权时回传待授权域，设置页在用户手势里直接调 permissions.request
+        if (error.permissionNeeded) sendResponse({ ok: false, error: error.message, permissionNeeded: error.permissionNeeded });
+        else sendResponse({ ok: false, error: error.message });
+      });
     return true;
   }
 

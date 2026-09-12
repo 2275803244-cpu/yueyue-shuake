@@ -4,8 +4,14 @@
 
 ## 下载
 
-- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.7.9.zip](release/yueyue-shuake-v3.7.9.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.8.0.zip](release/yueyue-shuake-v3.8.0.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
 - 用户脚本版（脚本猫 / 油猴）：[userscript/yueyue-shuake.user.js](userscript/yueyue-shuake.user.js)，安装说明见 [userscript/README.md](userscript/README.md)。
+
+## 权限说明（v3.8.0 起最小化）
+
+- **页面注入**：内容脚本只匹配网课域名（chaoxing/zhihuishu/yuketang/icourse163/edu.cn 等 20 个域），不再使用 `<all_urls>`；在小红书、知乎等工作页面完全不加载、不运行任何代码。
+- **AI 接口访问**：安装时不索取任何网站权限；在设置页保存/测试接口时，浏览器会弹出一次性授权，只授权你填的那一个接口域名（如 `api.deepseek.com`）。
+- **API Key**：仅存于本机扩展存储（chrome.storage.local，扩展间沙箱隔离），不外发到接口域名以外的任何地方。
 
 ## 安装
 

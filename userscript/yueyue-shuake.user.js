@@ -1,11 +1,30 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.7.9
+// @version      3.8.0
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
-// @match        *://*/*
-// @exclude      *://localhost/*
+// @match        *://*.chaoxing.com/*
+// @match        *://*.chaoxing.cn/*
+// @match        *://*.xuexitong.com/*
+// @match        *://*.zhihuishu.com/*
+// @match        *://*.changjietong.com/*
+// @match        *://*.yuketang.cn/*
+// @match        *://*.rainclassroom.com/*
+// @match        *://*.icve.com.cn/*
+// @match        *://*.icourse163.org/*
+// @match        *://*.icourse163.cn/*
+// @match        *://*.xuexi.cn/*
+// @match        *://*.gxt.hnvcp.com/*
+// @match        *://*.nodedu.cn/*
+// @match        *://*.sflep.com/*
+// @match        *://*.cnki.net/*
+// @match        *://*.mosoteach.cn/*
+// @match        *://*.mtcsun.com/*
+// @match        *://*.xuanyaedu.com/*
+// @match        *://*.classin.cn/*
+// @match        *://*.eelive.cn/*
+// @match        *://*.edu.cn/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -13,7 +32,14 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
-// @connect      *
+// @connect      api.deepseek.com
+// @connect      dashscope.aliyuncs.com
+// @connect      open.bigmodel.cn
+// @connect      api.moonshot.cn
+// @connect      api.siliconflow.cn
+// @connect      ark.cn-beijing.volces.com
+// @connect      localhost
+// @connect      127.0.0.1
 // @license      MIT
 // ==/UserScript==
 

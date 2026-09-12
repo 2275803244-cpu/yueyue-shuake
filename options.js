@@ -62,9 +62,19 @@ function readForm() {
   }));
 }
 
+async function ensureAiOriginPermission(endpoint) {
+  // v3.8.0：AI 接口域按需授权。保存/测试是用户手势，可以调 permissions.request
+  if (!endpoint) return;
+  let origin;
+  try { origin = new URL(endpoint).origin + "/*"; } catch { return; }
+  const granted = await chrome.permissions.contains({ origins: [origin] });
+  if (!granted) await chrome.permissions.request({ origins: [origin] });
+}
+
 async function save() {
   const config = readForm();
   try { JSON.parse(config.extraHeaders || "{}"); } catch { throw new Error("附加请求头不是合法 JSON"); }
+  await ensureAiOriginPermission(config.endpoint);
   const stored = await chrome.storage.local.get("aiConfig");
   await chrome.storage.local.set({ aiConfig: { ...(stored.aiConfig || {}), ...config } });
   return config;
@@ -129,6 +139,20 @@ document.querySelector("#test").addEventListener("click", async () => {
       type: "AI_REQUEST",
       questions: [{ question: 0, type: "single", stem: "1 + 1 等于多少？", options: ["1", "2", "3"] }]
     });
+    if (!response?.ok && response?.permissionNeeded) {
+      // 测试路径兜底：直接在本页（用户手势上下文）向浏览器申请该接口域权限
+      const origin = response.permissionNeeded;
+      const granted = await chrome.permissions.request({ origins: [origin] }).catch(() => false);
+      if (granted) {
+        const retry = await chrome.runtime.sendMessage({
+          type: "AI_REQUEST",
+          questions: [{ question: 0, type: "single", stem: "1 + 1 等于多少？", options: ["1", "2", "3"] }]
+        });
+        if (retry?.ok) { setStatus(`接口正常，测试答案：${JSON.stringify(retry.answers)}`); return; }
+        throw new Error(retry?.error || "接口没有响应");
+      }
+      throw new Error("未授权访问该 AI 接口域名");
+    }
     if (!response?.ok) throw new Error(response?.error || "接口没有响应");
     setStatus(`接口正常，测试答案：${JSON.stringify(response.answers)}`);
   } catch (error) {
