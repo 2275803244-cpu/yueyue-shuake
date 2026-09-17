@@ -511,8 +511,20 @@
     });
   }
 
+  function pendingVideos() {
+    return [...document.querySelectorAll("video")].filter((video) => !video.ended);
+  }
+
   async function playVideo(video) {
     if (!settings.enabled) return;
+    const queue = pendingVideos();
+    if (queue[0] !== video) {
+      if (!video.paused && !video.ended) video.pause();
+      return;
+    }
+    for (const other of queue.slice(1)) {
+      if (!other.paused) other.pause();
+    }
     video.muted = settings.muted;
     video.playbackRate = settings.playbackRate;
     if (!settings.autoResume || suspendVideoForQuiz || video.ended || Date.now() < intentionalPauseUntil) return;
@@ -527,7 +539,7 @@
   }
 
   async function goNext() {
-    if (!settings.enabled || !settings.autoNext || nextInProgress) return;
+    if (!settings.enabled || !settings.autoNext || nextInProgress || pendingVideos().length) return;
     if (hasVisibleIncompleteTaskMarker()) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "当前任务点尚未完成，等待平台确认完成" });
       publishStatus({ phase: "playing", message: "任务点尚未完成，暂不点击下一节" });
@@ -611,13 +623,14 @@
     updateTask(taskId, { label: `视频任务 ${videoSequence}`, type: "video", state: video.ended ? "done" : "waiting", detail: video.ended ? "播放完成" : "等待播放" });
     video.addEventListener("ended", () => {
       updateTask(taskId, { state: "done", detail: "播放完成" });
-      goNext();
+      const next = pendingVideos()[0];
+      if (next) playVideo(next);
     });
     video.addEventListener("ratechange", () => {
       if (settings.enabled && video.playbackRate !== settings.playbackRate) video.playbackRate = settings.playbackRate;
     });
     video.addEventListener("pause", () => {
-      if (video.ended || suspendVideoForQuiz || !settings.enabled || !settings.autoResume) return;
+      if (video.ended || suspendVideoForQuiz || !settings.enabled || !settings.autoResume || pendingVideos()[0] !== video) return;
       setTimeout(() => playVideo(video), 1000);
     });
   }
@@ -1984,6 +1997,7 @@
   }
 
   async function skipCompletedTaskIfNeeded() {
+    if (pendingVideos().length) return false;
     if (!settings.enabled || !settings.autoNext || !settings.skipCompleted || nextInProgress) return false;
     try {
       const quizState = await chrome.runtime.sendMessage({ type: "HAS_ACTIVE_VIDEO_QUIZ" });
@@ -2066,7 +2080,7 @@
         suspendVideoForQuiz = false;
         publishStatus({ phase: "playing", message: "题目已处理，正在恢复视频播放" });
       }
-      if (!blockingVideoQuiz) videos.forEach(playVideo);
+      if (!blockingVideoQuiz && pendingVideos().length) await playVideo(pendingVideos()[0]);
     } catch (error) {
       publishStatus({ phase: "error", message: `实时任务检测失败：${error.message}` });
     } finally {

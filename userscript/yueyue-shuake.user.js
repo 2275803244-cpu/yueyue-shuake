@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.8.0
+// @version      3.8.1
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
 // @match        *://*.chaoxing.com/*
@@ -1485,8 +1485,20 @@
   let intentionalPauseUntil = 0;
   let suspendVideoForQuiz = false;
 
+  function pendingVideos() {
+    return [...document.querySelectorAll("video")].filter((video) => !video.ended);
+  }
+
   async function playVideo(video) {
     if (!settings.enabled) return;
+    const queue = pendingVideos();
+    if (queue[0] !== video) {
+      if (!video.paused && !video.ended) video.pause();
+      return;
+    }
+    for (const other of queue.slice(1)) {
+      if (!other.paused) other.pause();
+    }
     video.muted = settings.muted;
     video.playbackRate = settings.playbackRate;
     if (!settings.autoResume || suspendVideoForQuiz || video.ended || Date.now() < intentionalPauseUntil) return;
@@ -1504,10 +1516,14 @@
     const taskId = `video:${++videoSequence}`;
     videoTaskIds.set(video, taskId);
     updateTask(taskId, { label: `视频任务 ${videoSequence}`, type: "video", state: video.ended ? "done" : "waiting", detail: video.ended ? "播放完成" : "等待播放" });
-    video.addEventListener("ended", () => { updateTask(taskId, { state: "done", detail: "播放完成" }); goNext(); });
+    video.addEventListener("ended", () => {
+      updateTask(taskId, { state: "done", detail: "播放完成" });
+      const next = pendingVideos()[0];
+      if (next) playVideo(next);
+    });
     video.addEventListener("ratechange", () => { if (settings.enabled && video.playbackRate !== settings.playbackRate) video.playbackRate = settings.playbackRate; });
     video.addEventListener("pause", () => {
-      if (video.ended || suspendVideoForQuiz || !settings.enabled || !settings.autoResume) return;
+      if (video.ended || suspendVideoForQuiz || !settings.enabled || !settings.autoResume || pendingVideos()[0] !== video) return;
       setTimeout(() => playVideo(video), 1000);
     });
   }
@@ -1720,7 +1736,7 @@
   }
 
   async function goNext() {
-    if (!settings.enabled || !settings.autoNext || nextInProgress) return;
+    if (!settings.enabled || !settings.autoNext || nextInProgress || pendingVideos().length) return;
     if (!IS_TOP) { postUp({ type: "yy-next" }); return; }
     if (hasVisibleIncompleteTaskMarker()) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "当前任务点尚未完成，等待平台确认完成" });
@@ -1810,6 +1826,7 @@
   }
 
   async function skipCompletedTaskIfNeeded() {
+    if (pendingVideos().length) return false;
     if (!settings.enabled || !settings.autoNext || !settings.skipCompleted || nextInProgress) return false;
     if (hasActiveVideoQuiz()) {
       updateTask("completion-check", { label: "完成状态检测", type: "navigation", state: "waiting", detail: "检测到视频弹题，暂不跳过" });
@@ -1871,7 +1888,7 @@
         suspendVideoForQuiz = false;
         publishStatus({ phase: "playing", message: "题目已处理，正在恢复视频播放" });
       }
-      if (!blockingVideoQuiz) videos.forEach(playVideo);
+      if (!blockingVideoQuiz) if (pendingVideos().length) await playVideo(pendingVideos()[0]);
     } catch (error) {
       publishStatus({ phase: "error", message: `实时任务检测失败：${error.message}` });
     } finally {

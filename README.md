@@ -4,8 +4,15 @@
 
 ## 下载
 
-- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.8.0.zip](release/yueyue-shuake-v3.8.0.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.8.1.zip](release/yueyue-shuake-v3.8.1.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
 - 用户脚本版（脚本猫 / 油猴）：[userscript/yueyue-shuake.user.js](userscript/yueyue-shuake.user.js)，安装说明见 [userscript/README.md](userscript/README.md)。
+
+## 3.8.1 同页多视频修复
+
+- 同一个文档内的视频按 DOM 顺序播放，一次只启动第一个未结束的视频；后续视频暂停时不再抢占重播。
+- 视频结束仅继续本页下一个视频，不再由 `ended` 事件直接切换章节；仍有未结束视频时阻止完成跳过。全部结束后仍由既有平台完成状态检查决定是否跳转。
+- 本次为同文档修复，不包含跨 iframe 播放仲裁或验证码处理。遇到验证码请停用自动操作，手动完成验证。
+- 扩展版与脚本版同步；权限及交卷设置未改变。
 
 ## 权限说明（v3.8.0 起最小化）
 
