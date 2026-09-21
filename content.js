@@ -66,6 +66,10 @@
   let orchestratorRunning = false;
   let suspendVideoForQuiz = false;
   let videoQuizHeartbeatTimer;
+  let playbackYieldUntil = 0;
+  let myFrameId = 0;
+  let playbackStateReportedAt = 0;
+  let playbackHeartbeatTimer;
   let lastCountSignature = "";
   let lastPublishedSignature = "";
   const taskMap = new Map();
@@ -515,8 +519,60 @@
     return [...document.querySelectorAll("video")].filter((video) => !video.ended);
   }
 
+  function yieldPlayback() {
+    playbackYieldUntil = Date.now() + 3000;
+    for (const video of document.querySelectorAll("video")) {
+      if (!video.paused && !video.ended) video.pause();
+    }
+  }
+
+  async function anotherFramePlaying() {
+    try {
+      const state = await chrome.runtime.sendMessage({ type: "PLAYBACK_ACTIVE_FRAME" });
+      if (state?.self !== undefined) myFrameId = state.self;
+      // frameId 0 是顶层 frame，布尔判断会把它当成“没有人在播”，必须显式判 null
+      const active = state?.active;
+      if (active !== null && active !== undefined && active !== myFrameId) {
+        yieldPlayback();
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function reportPlaybackState(playing, force = false) {
+    const now = Date.now();
+    if (!force && now - playbackStateReportedAt < 1200) return;
+    playbackStateReportedAt = now;
+    chrome.runtime.sendMessage({ type: "FRAME_PLAYBACK_STATE", pending: pendingVideos().length, playing }).catch(() => {});
+    // 播放租约只有 4 秒有效期，扫描间隙也要有心跳，否则别的 frame 会以为本 frame 已经播完
+    if (!playing) {
+      clearInterval(playbackHeartbeatTimer);
+      playbackHeartbeatTimer = undefined;
+      return;
+    }
+    if (!playbackHeartbeatTimer) {
+      playbackHeartbeatTimer = setInterval(() => {
+        chrome.runtime.sendMessage({ type: "FRAME_PLAYBACK_STATE", pending: pendingVideos().length, playing: locallyPlaying() }).catch(() => {});
+      }, 1500);
+    }
+  }
+
+  async function pendingVideosAnywhere() {
+    if (pendingVideos().length) return true;
+    try {
+      const state = await chrome.runtime.sendMessage({ type: "ANY_FRAMES_PENDING" });
+      return Boolean(state?.pending);
+    } catch { return false; }
+  }
+
+  function locallyPlaying() {
+    return [...document.querySelectorAll("video")].some((video) => !video.paused && !video.ended);
+  }
+
   async function playVideo(video) {
     if (!settings.enabled) return;
+    if (Date.now() < playbackYieldUntil) return;
     const queue = pendingVideos();
     if (queue[0] !== video) {
       if (!video.paused && !video.ended) video.pause();
@@ -525,6 +581,7 @@
     for (const other of queue.slice(1)) {
       if (!other.paused) other.pause();
     }
+    if (await anotherFramePlaying()) return;
     video.muted = settings.muted;
     video.playbackRate = settings.playbackRate;
     if (!settings.autoResume || suspendVideoForQuiz || video.ended || Date.now() < intentionalPauseUntil) return;
@@ -533,6 +590,7 @@
       const taskId = videoTaskIds.get(video);
       if (taskId) updateTask(taskId, { state: "running", detail: `${video.currentTime ? Math.floor(video.currentTime) + " 秒 · " : ""}${settings.playbackRate}× 播放` });
       publishStatus({ phase: "playing", message: "视频正在播放" });
+      reportPlaybackState(true, true);
     } catch {
       // 浏览器可能要求用户先与页面交互；下一轮扫描会重试。
     }
@@ -540,6 +598,13 @@
 
   async function goNext() {
     if (!settings.enabled || !settings.autoNext || nextInProgress || pendingVideos().length) return;
+    if (await pendingVideosAnywhere()) {
+      updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "还有其他 frame 的视频未播放完成" });
+      publishStatus({ phase: "playing", message: "还有其他视频未播放完成，继续学习" });
+      clearTimeout(quizDeferredNextTimer);
+      quizDeferredNextTimer = setTimeout(() => goNext(), 1500);
+      return;
+    }
     if (hasVisibleIncompleteTaskMarker()) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "当前任务点尚未完成，等待平台确认完成" });
       publishStatus({ phase: "playing", message: "任务点尚未完成，暂不点击下一节" });
@@ -624,13 +689,29 @@
     video.addEventListener("ended", () => {
       updateTask(taskId, { state: "done", detail: "播放完成" });
       const next = pendingVideos()[0];
-      if (next) playVideo(next);
+      if (next) {
+        playVideo(next);
+        return;
+      }
+      reportPlaybackState(false, true);
+      (async () => {
+        if (await pendingVideosAnywhere()) {
+          publishStatus({ phase: "playing", message: "本 frame 视频已完成，等待其他视频播放完成" });
+          clearTimeout(quizDeferredNextTimer);
+          quizDeferredNextTimer = setTimeout(() => {
+            pendingVideosAnywhere().then((pending) => { if (!pending) goNext(); });
+          }, 1200);
+          return;
+        }
+        goNext();
+      })();
     });
     video.addEventListener("ratechange", () => {
       if (settings.enabled && video.playbackRate !== settings.playbackRate) video.playbackRate = settings.playbackRate;
     });
     video.addEventListener("pause", () => {
       if (video.ended || suspendVideoForQuiz || !settings.enabled || !settings.autoResume || pendingVideos()[0] !== video) return;
+      if (Date.now() < playbackYieldUntil) return;
       setTimeout(() => playVideo(video), 1000);
     });
   }
@@ -1998,6 +2079,11 @@
 
   async function skipCompletedTaskIfNeeded() {
     if (pendingVideos().length) return false;
+    const elsewhere = await chrome.runtime.sendMessage({ type: "ANY_FRAMES_PENDING" }).catch(() => null);
+    if (elsewhere?.pending) {
+      updateTask("completion-check", { label: "完成状态检测", type: "navigation", state: "waiting", detail: `还有 ${elsewhere.pending} 个视频未播放完成，暂不跳过` });
+      return false;
+    }
     if (!settings.enabled || !settings.autoNext || !settings.skipCompleted || nextInProgress) return false;
     try {
       const quizState = await chrome.runtime.sendMessage({ type: "HAS_ACTIVE_VIDEO_QUIZ" });
@@ -2048,6 +2134,7 @@
       const readers = findDocumentReaders();
       const blockingVideoQuiz = questions.some(isBlockingVideoQuiz);
       reportVideoQuizState(blockingVideoQuiz);
+      reportPlaybackState(locallyPlaying());
 
       if (questions.length && settings.autoAnswer) {
         if (blockingVideoQuiz) {
@@ -2106,6 +2193,7 @@
     }
     if (!settings.enabled) {
       reportVideoQuizState(false);
+      reportPlaybackState(false, true);
       suspendVideoForQuiz = false;
       intentionalPauseUntil = Date.now() + 2000;
     }
@@ -2138,6 +2226,12 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "PLAYBACK_YIELD") {
+      yieldPlayback();
+      publishStatus({ phase: "playing", message: "其他 frame 的视频正在播放，本 frame 已让出" });
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message?.type === "FRAME_STATUS_UPDATE") {
       runtimeStatus = { ...runtimeStatus, ...message.status };
       renderFloatingStatus(runtimeStatus);

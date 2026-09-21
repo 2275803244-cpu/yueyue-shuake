@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.8.1
+// @version      3.8.2
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
 // @match        *://*.chaoxing.com/*
@@ -181,6 +181,20 @@
         break;
       case "yy-quiz-heartbeat":
         if (IS_TOP) quizHeartbeats.set(data.source, { active: data.active, at: Date.now() });
+        break;
+      case "yy-play-state":
+        if (IS_TOP) {
+          notePlayState(data.source, data.pending, data.playing);
+          broadcastPlayLease();
+        } else {
+          try { window.parent.postMessage({ ...data, __yueyue: true }, "*"); } catch {}
+        }
+        break;
+      case "yy-play-lease":
+        peerActiveFrame = data.active || "";
+        peerPendingTotal = Number(data.pending) || 0;
+        if (peerActiveFrame && peerActiveFrame !== frameId) yieldPlayback();
+        if (!IS_TOP) broadcast(data);
         break;
       case "yy-answer-now":
         answerQuestions(true, true).then((result) => postUp({ type: "yy-answer-result", result }));
@@ -1484,6 +1498,80 @@
   let videoSequence = 0;
   let intentionalPauseUntil = 0;
   let suspendVideoForQuiz = false;
+  let playbackYieldUntil = 0;
+  let peerActiveFrame = "";
+  let peerPendingTotal = 0;
+  let playbackStateReportedAt = 0;
+
+  // 跨 frame 播放协调：iframe 各自上报视频进度，顶层只允许一个 frame 同时播放，
+  // 并汇总“是否还有未看完的视频”，避免多个 iframe 互相抢播或提前跳章。
+  const PLAY_STATE_TTL_MS = 8000;
+  const PLAY_ACTIVE_TTL_MS = 4000;
+  const playFrames = new Map();
+  let activePlayFrame = "";
+  let activePlayFrameAt = 0;
+  let playLeaseTimer;
+
+  function notePlayState(source, pending, playing) {
+    const now = Date.now();
+    playFrames.set(source, { pending: Math.max(0, Number(pending) || 0), playing: Boolean(playing), at: now });
+    for (const [key, state] of playFrames) {
+      if (key !== source && now - state.at > PLAY_STATE_TTL_MS) playFrames.delete(key);
+    }
+    if (playing) {
+      if (activePlayFrame !== source || now - activePlayFrameAt > PLAY_ACTIVE_TTL_MS) activePlayFrame = source;
+      activePlayFrameAt = now;
+    } else if (activePlayFrame === source) {
+      activePlayFrame = "";
+      activePlayFrameAt = 0;
+    }
+  }
+
+  function broadcastPlayLease() {
+    const now = Date.now();
+    // 自己在播就顺路续租，否则播放间隙租约一过期，别的 frame 会把本 frame 挤下去
+    if (activePlayFrame === frameId && locallyPlaying()) activePlayFrameAt = now;
+    if (activePlayFrame && now - activePlayFrameAt > PLAY_ACTIVE_TTL_MS) { activePlayFrame = ""; activePlayFrameAt = 0; }
+    let pending = 0;
+    for (const state of playFrames.values()) {
+      if (now - state.at > PLAY_STATE_TTL_MS) continue;
+      pending += state.pending;
+    }
+    peerActiveFrame = activePlayFrame;
+    peerPendingTotal = pending;
+    const lease = { type: "yy-play-lease", active: activePlayFrame, pending };
+    broadcast(lease);
+    if (!IS_TOP) postUp(lease);
+    if (!playLeaseTimer) playLeaseTimer = setInterval(broadcastPlayLease, 1500);
+  }
+
+  function yieldPlayback() {
+    playbackYieldUntil = Date.now() + 3000;
+    for (const video of document.querySelectorAll("video")) {
+      if (!video.paused && !video.ended) video.pause();
+    }
+  }
+
+  function reportPlaybackState(playing, force = false) {
+    const now = Date.now();
+    if (!force && now - playbackStateReportedAt < 1200) return;
+    playbackStateReportedAt = now;
+    const pending = pendingVideos().length;
+    if (IS_TOP) {
+      notePlayState(frameId, pending, playing);
+      broadcastPlayLease();
+    } else {
+      postUp({ type: "yy-play-state", pending, playing });
+    }
+  }
+
+  function pendingVideosAnywhere() {
+    return pendingVideos().length > 0 || peerPendingTotal > 0;
+  }
+
+  function locallyPlaying() {
+    return [...document.querySelectorAll("video")].some((video) => !video.paused && !video.ended);
+  }
 
   function pendingVideos() {
     return [...document.querySelectorAll("video")].filter((video) => !video.ended);
@@ -1491,6 +1579,8 @@
 
   async function playVideo(video) {
     if (!settings.enabled) return;
+    if (Date.now() < playbackYieldUntil) return;
+    if (peerActiveFrame && peerActiveFrame !== frameId) { yieldPlayback(); return; }
     const queue = pendingVideos();
     if (queue[0] !== video) {
       if (!video.paused && !video.ended) video.pause();
@@ -1507,6 +1597,7 @@
       const taskId = videoTaskIds.get(video);
       if (taskId) updateTask(taskId, { state: "running", detail: `${video.currentTime ? Math.floor(video.currentTime) + " 秒 · " : ""}${settings.playbackRate}× 播放` });
       publishStatus({ phase: "playing", message: "视频正在播放" });
+      reportPlaybackState(true, true);
     } catch {}
   }
 
@@ -1519,11 +1610,22 @@
     video.addEventListener("ended", () => {
       updateTask(taskId, { state: "done", detail: "播放完成" });
       const next = pendingVideos()[0];
-      if (next) playVideo(next);
+      if (next) { playVideo(next); return; }
+      reportPlaybackState(false, true);
+      if (pendingVideosAnywhere()) {
+        publishStatus({ phase: "playing", message: "本 frame 视频已完成，等待其他视频播放完成" });
+        clearTimeout(quizDeferredNextTimer);
+        quizDeferredNextTimer = setTimeout(() => {
+          if (!pendingVideosAnywhere()) goNext();
+        }, 1200);
+        return;
+      }
+      goNext();
     });
     video.addEventListener("ratechange", () => { if (settings.enabled && video.playbackRate !== settings.playbackRate) video.playbackRate = settings.playbackRate; });
     video.addEventListener("pause", () => {
       if (video.ended || suspendVideoForQuiz || !settings.enabled || !settings.autoResume || pendingVideos()[0] !== video) return;
+      if (Date.now() < playbackYieldUntil) return;
       setTimeout(() => playVideo(video), 1000);
     });
   }
@@ -1737,6 +1839,13 @@
 
   async function goNext() {
     if (!settings.enabled || !settings.autoNext || nextInProgress || pendingVideos().length) return;
+    if (pendingVideosAnywhere()) {
+      updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "还有其他 frame 的视频未播放完成" });
+      publishStatus({ phase: "playing", message: "还有其他视频未播放完成，继续学习" });
+      clearTimeout(quizDeferredNextTimer);
+      quizDeferredNextTimer = setTimeout(() => goNext(), 1500);
+      return;
+    }
     if (!IS_TOP) { postUp({ type: "yy-next" }); return; }
     if (hasVisibleIncompleteTaskMarker()) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "当前任务点尚未完成，等待平台确认完成" });
@@ -1827,6 +1936,10 @@
 
   async function skipCompletedTaskIfNeeded() {
     if (pendingVideos().length) return false;
+    if (pendingVideosAnywhere()) {
+      updateTask("completion-check", { label: "完成状态检测", type: "navigation", state: "waiting", detail: "还有其他 frame 的视频未播放完成，暂不跳过" });
+      return false;
+    }
     if (!settings.enabled || !settings.autoNext || !settings.skipCompleted || nextInProgress) return false;
     if (hasActiveVideoQuiz()) {
       updateTask("completion-check", { label: "完成状态检测", type: "navigation", state: "waiting", detail: "检测到视频弹题，暂不跳过" });
@@ -1868,6 +1981,7 @@
       const readers = findDocumentReaders();
       const blockingVideoQuiz = questions.some(isBlockingVideoQuiz);
       reportQuizHeartbeat(blockingVideoQuiz);
+      reportPlaybackState(locallyPlaying());
       if (questions.length && settings.autoAnswer) {
         if (blockingVideoQuiz) {
           suspendVideoForQuiz = true;
@@ -1922,6 +2036,7 @@
     }
     if (!settings.enabled) {
       reportQuizHeartbeat(false);
+      reportPlaybackState(false, true);
       suspendVideoForQuiz = false;
       intentionalPauseUntil = Date.now() + 2000;
     }

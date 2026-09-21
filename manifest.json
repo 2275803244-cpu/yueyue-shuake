@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "玥玥刷客",
-  "version": "3.8.1",
+  "version": "3.8.2",
   "description": "带可拖动网页浮窗、实时任务状态和第三方 AI 答题能力的网课学习助手。",
   "permissions": [
     "storage",

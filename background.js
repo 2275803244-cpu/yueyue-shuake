@@ -40,11 +40,19 @@ const nextRequestLocks = new Map();
 const activeVideoQuizFrames = new Map();
 const frameStatusesByTab = new Map();
 const VIDEO_QUIZ_STATE_TTL_MS = 8000;
+// 跨 frame 播放协调：每个 frame 上报自己的视频进度，后台只允许一个 frame 同时播放，
+// 并汇总“是否还有未看完的视频”，避免多个 iframe 互相抢播或提前跳章。
+const playbackFramesByTab = new Map();
+const activePlaybackByTab = new Map();
+const PLAYBACK_STATE_TTL_MS = 8000;
+const PLAYBACK_ACTIVE_TTL_MS = 4000;
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   activeVideoQuizFrames.delete(tabId);
   frameStatusesByTab.delete(tabId);
   nextRequestLocks.delete(tabId);
+  playbackFramesByTab.delete(tabId);
+  activePlaybackByTab.delete(tabId);
 });
 
 chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
@@ -59,6 +67,11 @@ chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
   const statuses = frameStatusesByTab.get(tabId);
   statuses?.delete(frameId);
   if (statuses && !statuses.size) frameStatusesByTab.delete(tabId);
+  const playback = playbackFramesByTab.get(tabId);
+  playback?.delete(frameId);
+  if (playback && !playback.size) playbackFramesByTab.delete(tabId);
+  const active = activePlaybackByTab.get(tabId);
+  if (active && (frameId === 0 || active.frameId === frameId)) activePlaybackByTab.delete(tabId);
 });
 
 function aggregateFrameStatuses(statuses) {
@@ -696,6 +709,61 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (!frames.size) activeVideoQuizFrames.delete(sender.tab.id);
     sendResponse({ ok: true, active: frames.size > 0, frameCount: frames.size });
+    return false;
+  }
+
+  if (message?.type === "FRAME_PLAYBACK_STATE" && sender.tab?.id) {
+    const tabId = sender.tab.id;
+    const frameId = sender.frameId ?? 0;
+    const now = Date.now();
+    const frames = playbackFramesByTab.get(tabId) || new Map();
+    frames.set(frameId, { pending: Math.max(0, Number(message.pending) || 0), playing: Boolean(message.playing), at: now });
+    for (const [id, state] of frames) {
+      if (id !== frameId && now - state.at > PLAYBACK_STATE_TTL_MS) frames.delete(id);
+    }
+    if (frames.size) playbackFramesByTab.set(tabId, frames);
+    else playbackFramesByTab.delete(tabId);
+
+    const active = activePlaybackByTab.get(tabId);
+    if (message.playing) {
+      if (!active || active.frameId !== frameId || now - active.at > PLAYBACK_ACTIVE_TTL_MS) {
+        activePlaybackByTab.set(tabId, { frameId, at: now });
+        for (const id of frames.keys()) {
+          if (id === frameId) continue;
+          chrome.tabs.sendMessage(tabId, { type: "PLAYBACK_YIELD" }, { frameId: id }).catch(() => {});
+        }
+      } else {
+        active.at = now;
+      }
+    } else if (active && active.frameId === frameId) {
+      activePlaybackByTab.delete(tabId);
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message?.type === "PLAYBACK_ACTIVE_FRAME" && sender.tab?.id) {
+    const tabId = sender.tab.id;
+    const active = activePlaybackByTab.get(tabId);
+    const stale = active && Date.now() - active.at > PLAYBACK_ACTIVE_TTL_MS;
+    if (stale) activePlaybackByTab.delete(tabId);
+    sendResponse({ ok: true, active: stale ? null : active?.frameId ?? null, self: sender.frameId ?? 0 });
+    return false;
+  }
+
+  if (message?.type === "ANY_FRAMES_PENDING" && sender.tab?.id) {
+    const frames = playbackFramesByTab.get(sender.tab.id);
+    const now = Date.now();
+    let pending = 0;
+    let frames_alive = 0;
+    if (frames) {
+      for (const state of frames.values()) {
+        if (now - state.at > PLAYBACK_STATE_TTL_MS) continue;
+        frames_alive += 1;
+        pending += state.pending;
+      }
+    }
+    sendResponse({ ok: true, pending, frameCount: frames_alive });
     return false;
   }
 
