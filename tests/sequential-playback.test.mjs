@@ -4,7 +4,7 @@ import vm from "node:vm";
 
 for (const file of ["../content.js", "../userscript/yueyue-shuake.user.js"]) {
   const source = readFileSync(new URL(file, import.meta.url), "utf8");
-  const playback = source.slice(source.indexOf("  function pendingVideos()"), source.indexOf("  async function goNext()", source.indexOf("  function pendingVideos()")));
+  const playback = source.slice(source.indexOf("  function pendingVideos()"), source.indexOf("  async function goNext", source.indexOf("  function pendingVideos()")));
   const attachStart = source.indexOf("  function attach(video)");
   const attachEnd = source.indexOf("\n  // ----------", attachStart);
   const playEnd = playback.indexOf("\n  function attach(video)");
@@ -27,6 +27,9 @@ for (const file of ["../content.js", "../userscript/yueyue-shuake.user.js"]) {
     // 跨 frame 播放协调引入的状态与依赖（沙箱只跑同文档串行这一段）
     playbackYieldUntil: 0, playbackStateReportedAt: 0, playbackHeartbeatTimer: undefined, myFrameId: 0, peerActiveFrame: "", frameId: 0,
     yieldPlayback() {}, reportPlaybackState() {}, pendingVideosAnywhere() { return false; },
+    // v3.9.0 看门狗 / 手动停止：沙箱里只提供桩，行为由专门测试覆盖
+    userStopped: false, sectionStats: { videos: 0, questions: 0 },
+    watchPlayback() {}, clearStallWatch() {}, stallWatch: null,
     chrome: { runtime: { sendMessage: async () => ({}) } },
     observedVideos: new WeakSet(), videoTaskIds: new WeakMap(), videoSequence: 0,
     updateTask() {}, publishStatus() {}, goNext() { navigation++; },
@@ -64,7 +67,10 @@ for (const file of ["../content.js", "../userscript/yueyue-shuake.user.js"]) {
   sandbox.suspendVideoForQuiz = true;
   await api.playVideo(videos[0]);
   assert.equal(videos[0].plays, before, "quiz pause remains effective");
-  assert.match(source, /async function goNext\(\) \{\s*if \([^\n]*pendingVideos\(\)\.length\) return;/);
+  // goNext(force) 只在「跳过本节」时绕过本地拦路条件；force=false 时仍必须先看本 frame 有没有待播视频
+  assert.match(source, /async function goNext\(force = false\) \{/);
+  assert.match(source, /if \(userStopped && !force\) \{/);
+  assert.match(source, /if \(!force && pendingVideos\(\)\.length\) return;/);
   assert.match(source, /async function skipCompletedTaskIfNeeded\(\) \{\s*if \(pendingVideos\(\)\.length\) return false;/);
   assert.ok(!source.includes("videos.forEach(playVideo)"));
   console.log(`PASS ${file}: 13 sequential playback and guard assertions`);

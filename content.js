@@ -24,7 +24,8 @@
     nextRetryDelayMs: 1200,
     nextSelector: "",
     autoAnswer: false,
-    autoSubmit: false
+    autoSubmit: false,
+    retryUnfilled: true
   };
   const DEFAULT_AI_CONFIG = {
     questionSelector: '#ext-comp-1046 .tkItem, .tkItem, .ans-videoquiz, #ext-comp-1046, .TiMu, .newTiMu, .questionLi, .question, .quiz-question, .exam-question, [data-question], [class*="question-item"]',
@@ -71,6 +72,15 @@
   let playbackStateReportedAt = 0;
   let playbackHeartbeatTimer;
   let captchaPaused = false;
+  let eventLog = [];
+  let aiFailures = 0;
+  let aiRetryNotBefore = 0;
+  let userStopped = false;
+  let sectionStats = { href: "", chapter: "", startedAt: Date.now(), videos: 0, questions: 0 };
+  let failedQuestions = [];
+  let stallWatch = null;
+  const STALL_AFTER_MS = 90000;
+  const STALL_GIVEUP_MS = 180000;
   let lastCountSignature = "";
   let lastPublishedSignature = "";
   const taskMap = new Map();
@@ -124,6 +134,8 @@
     const next = { ...runtimeStatus, ...patch, updatedAt: Date.now() };
     const signature = JSON.stringify([
       next.phase, next.message, next.videoCount, next.documentCount, next.questionCount, next.filledCount,
+      next.courseProgress?.done, next.courseProgress?.chapter,
+      next.sectionStats?.videos, next.sectionStats?.questions, Math.floor((next.sectionStats?.elapsed || 0) / 10000),
       (next.tasks || []).map((task) => [task.id, task.state, task.detail])
     ]);
     runtimeStatus = next;
@@ -159,7 +171,7 @@
   function floatingPhaseLabel(phase) {
     return {
       idle: "等待启动", scanning: "正在检测", playing: "视频学习中", reading: "课件阅读中",
-      answering: "AI 正在答题", done: "本轮已完成", error: "需要处理", paused: "需要手动验证"
+      answering: "AI 正在答题", done: "本轮已完成", error: "需要处理", paused: "需要手动验证", stopped: "本节已停止"
     }[phase] || "正在运行";
   }
 
@@ -193,6 +205,13 @@
     floatingUi.progressFill.style.width = `${pct}%`;
     const activeTask = (status.tasks || []).find((task) => task.state === "running" || task.state === "error");
     floatingUi.activeTask.textContent = activeTask ? `${activeTask.label} · ${activeTask.detail || ""}` : "暂无进行中的任务";
+    const course = status.courseProgress;
+    const stats = status.sectionStats;
+    floatingUi.courseCount.textContent = course && course.total ? `${course.done}/${course.total}` : "—";
+    floatingUi.courseName.textContent = course?.chapter ? `当前 ${course.chapter}` : "课程进度";
+    floatingUi.courseStat.textContent = stats
+      ? `本节 视频 ${stats.videos} · 答题 ${stats.questions} · ${formatElapsed(stats.elapsed)}`
+      : "";
   }
 
   async function saveFloatingSetting(patch) {
@@ -250,17 +269,19 @@
         .panel[data-mode="dark"]{--ink:#f0f0f3;--dim:#a8a8b3;--faint:#6d6d78;--bg:#151517;--surface:#1c1c1f;--lift:#232327;--line:#2c2c31;--track:#26262b;--on:#f0f0f3;--knob:#151517;--go:#22c55e;--shadow:0 10px 32px rgba(0,0,0,.5)}
         .head{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:9px;padding:11px 12px;border-bottom:1px solid var(--line);background:var(--bg);cursor:grab;user-select:none;touch-action:none}.head:active{cursor:grabbing}
         .logo{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:var(--on);color:var(--knob);font-size:13px;font-weight:800}.title strong,.title small{display:block}.title strong{font-size:12.5px;font-weight:800;letter-spacing:.2px}.title small{margin-top:1px;color:var(--faint);font-size:9px}
-        .head-actions{display:flex;gap:2px;align-items:center}.led{width:6px;height:6px;border-radius:50%;background:var(--faint);margin:0 6px 0 2px;flex:none;transition:background .3s}.led.playing,.led.reading,.led.answering,.led.scanning{background:var(--go)}.led.done{background:var(--go)}.led.error,.led.paused{background:var(--err)}
+        .head-actions{display:flex;gap:2px;align-items:center}.led{width:6px;height:6px;border-radius:50%;background:var(--faint);margin:0 6px 0 2px;flex:none;transition:background .3s}.led.playing,.led.reading,.led.answering,.led.scanning{background:var(--go)}.led.done{background:var(--go)}.led.error,.led.paused,.led.stopped{background:var(--err)}
         .icon-btn{display:grid;place-items:center;width:24px;height:24px;padding:0;border:0;border-radius:6px;color:var(--dim);background:transparent;transition:background .15s,color .15s}.icon-btn:hover{background:var(--surface);color:var(--ink)}
         .body{padding:12px}.panel.collapsed .body{display:none}.panel.collapsed{width:236px}.panel.collapsed .collapse svg{transform:rotate(180deg)}.icon-btn svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s}.body::-webkit-scrollbar{width:6px}.body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--faint) 40%,transparent);border-radius:99px}
-        .status{padding:1px 2px 11px}.status .row1{display:flex;align-items:center;justify-content:space-between}.phase-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:99px;background:var(--surface);color:var(--ink);font-size:10px;font-weight:700}.phase-chip i{width:6px;height:6px;border-radius:50%;background:var(--faint);transition:background .3s}.phase-chip.playing i,.phase-chip.reading i,.phase-chip.answering i,.phase-chip.scanning i{background:var(--go);animation:phasepulse 1.4s infinite}.phase-chip.done i{background:var(--go)}.phase-chip.error i,.phase-chip.paused i{background:var(--err)}@keyframes phasepulse{50%{opacity:.45}}
+        .status{padding:1px 2px 11px}.status .row1{display:flex;align-items:center;justify-content:space-between}.phase-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:99px;background:var(--surface);color:var(--ink);font-size:10px;font-weight:700}.phase-chip i{width:6px;height:6px;border-radius:50%;background:var(--faint);transition:background .3s}.phase-chip.playing i,.phase-chip.reading i,.phase-chip.answering i,.phase-chip.scanning i{background:var(--go);animation:phasepulse 1.4s infinite}.phase-chip.done i{background:var(--go)}.phase-chip.error i,.phase-chip.paused i,.phase-chip.stopped i{background:var(--err)}@keyframes phasepulse{50%{opacity:.45}}
         .progress{height:3px;margin-top:9px;border-radius:99px;background:var(--track);overflow:hidden}.progress i{display:block;height:100%;border-radius:99px;background:var(--on);transition:width .4s ease}
         .status strong,.status small{display:block}.status small{margin-top:8px;overflow:hidden;color:var(--faint);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.status-count{display:flex;align-items:baseline;gap:1px;color:var(--faint);font-size:10px;font-weight:700}.status-count b{color:var(--ink);font-size:11.5px;font-variant-numeric:tabular-nums}.status-count span{font-variant-numeric:tabular-nums}
         .metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.metric{text-align:center;padding:9px 0 8px;border-right:1px solid var(--line);transition:background .15s}.metric:hover{background:var(--surface)}.metric:last-child{border:0}.metric span{display:block;color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.metric b{display:block;margin-top:3px;font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
+        .course{display:flex;align-items:baseline;gap:6px;padding:0 2px 10px;color:var(--faint);font-size:9.5px}.course b{color:var(--dim);font-variant-numeric:tabular-nums}.course .c-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.course .c-stat{flex:none;font-variant-numeric:tabular-nums}
         .task-line{padding:0 2px 11px}.task-line .lab{color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.task-line .txt{margin-top:3px;color:var(--dim);font-size:10px;line-height:1.5}
         .master{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:10px;background:var(--surface)}.master strong{font-size:11.5px;font-weight:700}.master small{display:block;margin-top:1px;color:var(--faint);font-size:9px}.switch{position:relative;width:36px;height:21px;flex:none}.switch input{position:absolute;opacity:0}.switch i{display:block;width:36px;height:21px;border-radius:99px;background:var(--track);transition:.2s}.switch i:after{content:'';position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:var(--knob);box-shadow:0 1px 2px rgba(0,0,0,.2);transition:.2s}.switch input:checked+i{background:var(--on)}.switch input:checked+i:after{transform:translateX(15px)}
         .options{display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:10px}.check{display:flex;align-items:center;gap:8px;min-height:30px;padding:5px 8px;border-radius:8px;color:var(--dim);font-size:10.5px;transition:color .15s,background .15s;cursor:pointer}.check:hover{color:var(--ink);background:var(--surface)}.check input{margin:0;flex:none;width:15px;height:15px;border-radius:5px;accent-color:var(--on)}.speed{display:flex;align-items:center;justify-content:space-between}.speed select{width:70px;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);font-size:10px}
         .actions{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:6px;margin-top:10px}.action{min-height:34px;padding:7px 4px;border:0;border-radius:9px;font-size:11px;font-weight:700;transition:background .15s,transform .12s,border-color .15s}.action:hover{background:#333339}.action:active{transform:scale(.96)}.answer{color:var(--knob);background:var(--on)}.model,.diag{color:var(--ink);background:var(--lift);border:1px solid var(--line)}.model:hover,.diag:hover{background:var(--surface);border-color:var(--dim)}
+        .actions.row2{grid-template-columns:1fr 1fr;margin-top:6px}.actions.row2 .action{min-height:30px;font-size:10.5px;font-weight:600;background:transparent;border:1px solid var(--line);color:var(--dim)}.actions.row2 .action:hover{background:var(--surface);border-color:var(--dim);color:var(--ink)}.actions.row2 .action.stopped{color:var(--knob);background:var(--on);border-color:var(--on)}
         .customizer{margin-bottom:11px;padding:11px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.customizer[hidden]{display:none}.custom-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.custom-head strong{font-size:11px;font-weight:700}.reset{padding:0;border:0;color:var(--dim);background:transparent;font-size:10px}.reset:hover{color:var(--ink);text-decoration:underline}.custom-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.custom-field{display:flex;flex-direction:column;gap:5px;color:var(--faint);font-size:9px}.custom-field select,.custom-field input[type=range]{width:100%;accent-color:var(--on)}.custom-field select{padding:5px;border:1px solid var(--line);border-radius:8px;background:var(--lift);color:var(--ink)}.opacity-label{display:flex;justify-content:space-between}.mode-row{display:flex;gap:7px}.mode-btn{display:grid;place-items:center;width:22px;height:22px;padding:0;border:1px solid var(--line);border-radius:8px;background:var(--lift);color:var(--dim);font-size:10.5px;transition:color .15s,border-color .15s,background .15s}.mode-btn:hover{color:var(--ink);border-color:var(--dim)}.mode-btn.active{color:var(--knob);background:var(--on);border-color:var(--on)}.compact-check{display:flex;align-items:center;gap:5px;color:var(--dim);font-size:10px;cursor:pointer}.compact-check input{accent-color:var(--on)}.panel.compact .metrics,.panel.compact .task-line{display:none}
       </style>
       <section class="panel">
@@ -288,6 +309,7 @@
             <small class="status-message">启用后自动检测页面任务</small>
           </div>
           <div class="metrics"><span class="metric"><span>视频</span><b class="video-count">0</b></span><span class="metric"><span>课件</span><b class="document-count">0</b></span><span class="metric"><span>题目</span><b class="question-count">0</b></span></div>
+          <div class="course"><b class="c-count">—</b><span class="c-name">课程进度</span><span class="c-stat"></span></div>
           <div class="task-line"><div class="lab">当前任务</div><div class="txt">暂无进行中的任务</div></div>
           <div class="master"><span><strong>启用当前站点</strong><small>开启后自动接管页面任务</small></span><label class="switch"><input class="enabled" type="checkbox"><i></i></label></div>
           <div class="options">
@@ -300,6 +322,7 @@
             <label class="check speed">速度<select class="rate"><option value="1">1.0×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2.0×</option></select></label>
           </div>
           <div class="actions"><button class="action answer">立即答题</button><button class="action model">模型设置</button><button class="action diag">复制诊断</button></div>
+          <div class="actions row2"><button class="action stop">停止本节</button><button class="action skip">跳过本节</button></div>
         </div>
       </section>`;
     document.documentElement.append(host);
@@ -307,6 +330,7 @@
     floatingUi = {
       host, panel: find(".panel"), head: find(".head"), headLed: find(".led"), phaseChip: find(".phase-chip"), statusTitle: find(".status-title"), statusMessage: find(".status-message"), statusNow: find(".status-now"), statusTotal: find(".status-total"), progressFill: find(".progress-fill"),
       videoCount: find(".video-count"), documentCount: find(".document-count"), questionCount: find(".question-count"), activeTask: find(".task-line .txt"),
+      courseCount: find(".c-count"), courseName: find(".c-name"), courseStat: find(".c-stat"), stopButton: find(".stop"),
       enabled: find(".enabled"), autoResume: find(".auto-resume"), autoReadDocuments: find(".auto-document"), autoAnswer: find(".auto-answer"), autoSubmit: find(".auto-submit"), autoNext: find(".auto-next"), skipCompleted: find(".skip-completed"), playbackRate: find(".rate"),
       customizer: find(".customizer"), customWidth: find(".custom-width"), customOpacity: find(".custom-opacity"), customOpacityValue: find(".opacity-value"), customCompact: find(".custom-compact"), modeButtons: [...shadow.querySelectorAll(".mode-btn")]
     };
@@ -358,11 +382,24 @@
       }
     });
     find(".model").addEventListener("click", () => chrome.runtime.sendMessage({ type: "OPEN_OPTIONS" }).catch(() => {}));
+    find(".stop").addEventListener("click", () => toggleStopSection());
+    find(".skip").addEventListener("click", () => { skipCurrentChapter().catch(() => {}); });
+    document.addEventListener("keydown", handleShortcut, true);
     find(".diag").addEventListener("click", async () => {
       publishStatus({ phase: "scanning", message: "正在收集全部 frame 的诊断信息…" });
       try {
         const result = await chrome.runtime.sendMessage({ type: "DIAGNOSE_ALL_FRAMES" });
         const lines = ["=== 玥玥刷客诊断 ===", `页面：${location.href}`];
+        if (eventLog.length) {
+          lines.push(`本 frame 事件（最近 ${eventLog.length} 条）：`);
+          for (const entry of eventLog) lines.push(`  ${new Date(entry.at).toLocaleTimeString()} [${entry.kind}] ${entry.message}`);
+        }
+        if (failedQuestions.length) {
+          lines.push(`本 frame 错题本（${failedQuestions.length} 题）：`);
+          for (const item of failedQuestions.slice(-10)) lines.push(`  ${item.stem} —— ${item.reason}`);
+        }
+        if (stallWatch) lines.push(`看门狗：${stallWatch.recovered ? "已尝试恢复" : "未介入"}，停在 ${Math.floor(stallWatch.video?.currentTime || 0)} 秒`);
+        if (userStopped) lines.push("用户已手动停止本节");
         let totalQuestions = 0;
         for (const item of result?.results || []) {
           const frame = item?.response;
@@ -626,8 +663,195 @@
     return false;
   }
 
+  // ---------- v3.9.0：挂机更稳 / 答得更准 / 用得更省事 / 学得更多 ----------
+  const readStore = (key) => chrome.storage.local.get(key).then((value) => value?.[key]).catch(() => undefined);
+  const writeStore = (key, value) => chrome.storage.local.set({ [key]: value }).catch(() => {});
+
+  function logEvent(kind, message) {
+    eventLog.push({ at: Date.now(), kind, message: normalizeText(message).slice(0, 160) });
+    if (eventLog.length > 40) eventLog = eventLog.slice(-40);
+  }
+
+  // AI 连续失败时退避，避免接口抽风时空转刷屏；成功一次就清零
+  function noteAiFailure(message) {
+    aiFailures = Math.min(aiFailures + 1, 8);
+    const waitMs = Math.min(300000, 5000 * 2 ** (aiFailures - 1));
+    aiRetryNotBefore = Date.now() + waitMs;
+    logEvent("ai", `AI 连续失败第 ${aiFailures} 次：${message}（${Math.round(waitMs / 1000)} 秒后重试）`);
+  }
+
+  function noteAiSuccess() {
+    if (aiFailures) logEvent("ai", `AI 接口恢复正常（此前失败 ${aiFailures} 次）`);
+    aiFailures = 0;
+    aiRetryNotBefore = 0;
+  }
+
+  // 挂机看门狗：只盯本 frame 真正在播的视频。
+  // 卡住时先诚实重试一次播放；再卡就明确报「自动恢复无效」，不伪造任何进度。
+  function watchPlayback(video) {
+    if (stallWatch?.video === video) {
+      stallWatch.lastCheck = Date.now();
+      return;
+    }
+    stallWatch = { video, lastCheck: Date.now(), lastProgressTime: video.currentTime || 0, recovered: false, warned: false };
+  }
+
+  function clearStallWatch(video) {
+    if (!stallWatch) return;
+    if (video && stallWatch.video !== video) return;
+    stallWatch = null;
+  }
+
+  function checkStall() {
+    const watch = stallWatch;
+    if (!watch || !watch.video || watch.video.ended) { stallWatch = null; return; }
+    if (watch.video.paused) { watch.lastCheck = Date.now(); return; }
+    if (Math.floor(watch.video.currentTime) !== Math.floor(watch.lastProgressTime || 0)) {
+      watch.lastProgressTime = watch.video.currentTime;
+      watch.lastCheck = Date.now();
+      return;
+    }
+    const idle = Date.now() - watch.lastCheck;
+    if (idle < STALL_AFTER_MS) return;
+    const taskId = videoTaskIds.get(watch.video);
+    if (idle < STALL_GIVEUP_MS && !watch.recovered) {
+      watch.recovered = true;
+      watch.lastCheck = Date.now();
+      logEvent("stall", `视频卡在 ${Math.floor(watch.video.currentTime)} 秒，尝试恢复播放`);
+      if (taskId) updateTask(taskId, { state: "running", detail: `卡在 ${Math.floor(watch.video.currentTime)} 秒，正在尝试恢复播放` });
+      publishStatus({ phase: "playing", message: `视频疑似卡住（停在 ${Math.floor(watch.video.currentTime)} 秒），正在尝试恢复播放` });
+      watch.video.play().catch(() => {});
+      return;
+    }
+    if (!watch.warned) {
+      watch.warned = true;
+      logEvent("stall", "自动恢复播放无效，页面可能需要手动处理");
+      if (taskId) updateTask(taskId, { state: "error", detail: "自动恢复无效，请检查页面（视频源/清晰度/登录态）" });
+      publishStatus({ phase: "error", message: "视频自动恢复无效：播放长时间没有推进，请手动检查页面（可暂停后继续）" });
+    }
+  }
+
+  function courseKey() {
+    try {
+      const params = new URLSearchParams(location.search || "");
+      return params.get("courseId") || params.get("courseid") || (location.pathname || "").split("/").filter(Boolean).pop() || "current";
+    } catch { return "current"; }
+  }
+
+  function chapterKey() {
+    try {
+      const params = new URLSearchParams(location.search || "");
+      return params.get("chapterId") || params.get("chapterid") || "";
+    } catch { return ""; }
+  }
+
+  // 课程进度只做展示和记录，不会替用户跳章节
+  function readCourseProgress() {
+    if (window !== window.top) return null;
+    let nodes = [];
+    try { nodes = [...document.querySelectorAll("#coursetree .posCatalog_select, .posCatalog_select")]; } catch { return null; }
+    nodes = nodes.filter((node, index, all) => all.indexOf(node) === index);
+    if (!nodes.length) return null;
+    const items = nodes.map((node) => ({
+      name: normalizeText(node.querySelector(".posCatalog_name")?.textContent || node.textContent || "").slice(0, 20),
+      active: node.classList.contains("posCatalog_active") || Boolean(node.querySelector(".posCatalog_active")),
+      unfinished: Boolean(node.querySelector(".jobUnfinishCount, .jobUnfinish, .orangeNew, [class*='unfinish'], [class*='Unfinish']"))
+    }));
+    const actives = items.filter((item) => item.active);
+    return {
+      total: items.length,
+      done: items.filter((item) => !item.unfinished).length,
+      chapter: actives.length ? actives[actives.length - 1].name : ""
+    };
+  }
+
+  // 换节时重置本节统计，并记住「上次学到哪一节」，下次进来只提示不自动跳
+  function syncSectionContext(chapter) {
+    const changed = sectionStats.href !== location.href || (chapter && sectionStats.chapter !== chapter);
+    if (!changed) return false;
+    if (sectionStats.href) logEvent("chapter", `切换到「${chapter || "未知章节"}」`);
+    sectionStats = { href: location.href, chapter, startedAt: Date.now(), videos: 0, questions: 0 };
+    if (!chapter) return true;
+    const key = `courseProgress:${courseKey()}`;
+    readStore(key).then((previous) => {
+      if (previous?.chapter && previous.chapter !== chapter && Date.now() - Number(previous.at || 0) < 7 * 86400000) {
+        publishStatus({ message: `上次学到「${previous.chapter}」，现在在「${chapter}」` });
+      }
+      writeStore(key, { chapter, chapterId: chapterKey(), at: Date.now() });
+    });
+    return true;
+  }
+
+  function formatElapsed(ms) {
+    const total = Math.max(0, Math.round(Number(ms || 0) / 1000));
+    const minutes = Math.floor(total / 60);
+    if (minutes < 60) return `${String(minutes).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+    return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+  }
+
+  function toggleStopSection() {
+    userStopped = !userStopped;
+    if (userStopped) {
+      for (const video of document.querySelectorAll("video")) if (!video.paused && !video.ended) video.pause();
+      clearStallWatch();
+      reportPlaybackState(false, true);
+      updateTask("user-stop", { label: "本节操作", type: "system", state: "waiting", detail: "已手动停止本节" });
+      publishStatus({ phase: "stopped", message: "已停止本节自动操作，点「继续本节」或按 Alt+Shift+S 恢复" });
+      logEvent("user", "手动停止本节");
+    } else {
+      updateTask("user-stop", { label: "本节操作", type: "system", state: "done", detail: "已恢复自动操作" });
+      publishStatus({ phase: "playing", message: "已恢复本节自动操作" });
+      logEvent("user", "恢复本节自动操作");
+      scheduleOrchestrator();
+    }
+    if (floatingUi?.stopButton) floatingUi.stopButton.textContent = userStopped ? "继续本节" : "停止本节";
+  }
+
+  // 跳过本节：只跳过「本 frame 还有待播视频 / 验证码 / 其他 frame 待播」这些本地拦路条件，
+  // 平台自己的「任务点未完成」确认框照旧照问，绝不替用户强点提交。
+  async function skipCurrentChapter() {
+    logEvent("user", "手动跳过本节");
+    for (const video of document.querySelectorAll("video")) if (!video.paused && !video.ended) video.pause();
+    clearStallWatch();
+    reportPlaybackState(false, true);
+    updateTask("user-stop", { label: "本节操作", type: "system", state: "done", detail: "按要求跳过本节" });
+    publishStatus({ phase: "scanning", message: "正在跳到下一节…" });
+    await goNext(true);
+  }
+
+  function isTypingTarget(target) {
+    const element = target || document.activeElement;
+    if (!element) return false;
+    if (element.isContentEditable) return true;
+    const tag = String(element.tagName || "").toUpperCase();
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  }
+
+  function handleShortcut(event) {
+    if (!event.altKey || !event.shiftKey || event.ctrlKey || event.metaKey) return;
+    const key = String(event.key || "").toLowerCase();
+    if (!["s", "n", "a"].includes(key)) return;
+    if (isTypingTarget(event.target)) return;
+    event.preventDefault();
+    if (key === "s") toggleStopSection();
+    else if (key === "n") skipCurrentChapter();
+    else chrome.runtime.sendMessage({ type: "ANSWER_NOW" }).catch(() => {});
+  }
+
+  function rememberFailedQuestions(records) {
+    const stamp = Date.now();
+    for (const record of records) {
+      if (!record || record.ok === true || !Number.isInteger(record.q) || record.q < 0) continue;
+      const stem = record.stem || "";
+      if (!stem) continue;
+      const key = shortFingerprint(stem.replace(/\s+/g, "").slice(0, 80));
+      const rest = failedQuestions.filter((item) => item.key !== key);
+      failedQuestions = [...rest, { key, stem: stem.slice(0, 60), reason: record.reason, at: stamp }].slice(-50);
+    }
+  }
+
   async function playVideo(video) {
-    if (!settings.enabled) return;
+    if (!settings.enabled || userStopped) return;
     if (Date.now() < playbackYieldUntil) return;
     const queue = pendingVideos();
     if (queue[0] !== video) {
@@ -647,20 +871,27 @@
       if (taskId) updateTask(taskId, { state: "running", detail: `${video.currentTime ? Math.floor(video.currentTime) + " 秒 · " : ""}${settings.playbackRate}× 播放` });
       publishStatus({ phase: "playing", message: "视频正在播放" });
       reportPlaybackState(true, true);
+      watchPlayback(video);
     } catch {
       // 浏览器可能要求用户先与页面交互；下一轮扫描会重试。
     }
   }
 
-  async function goNext() {
-    if (!settings.enabled || !settings.autoNext || nextInProgress || pendingVideos().length) return;
-    if (captchaPaused) {
+  // force 只由「跳过本节」按钮传入：跳过本地拦路条件，不跳过平台自己的完成确认
+  async function goNext(force = false) {
+    if (!settings.enabled || !settings.autoNext || nextInProgress) return;
+    if (userStopped && !force) {
+      updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "本节已被手动停止" });
+      return;
+    }
+    if (!force && pendingVideos().length) return;
+    if (!force && captchaPaused) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "平台验证码未完成，暂停跳转" });
       clearTimeout(quizDeferredNextTimer);
       quizDeferredNextTimer = setTimeout(() => goNext(), 1500);
       return;
     }
-    if (await pendingVideosAnywhere()) {
+    if (!force && await pendingVideosAnywhere()) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "还有其他 frame 的视频未播放完成" });
       publishStatus({ phase: "playing", message: "还有其他视频未播放完成，继续学习" });
       clearTimeout(quizDeferredNextTimer);
@@ -750,6 +981,8 @@
     updateTask(taskId, { label: `视频任务 ${videoSequence}`, type: "video", state: video.ended ? "done" : "waiting", detail: video.ended ? "播放完成" : "等待播放" });
     video.addEventListener("ended", () => {
       updateTask(taskId, { state: "done", detail: "播放完成" });
+      clearStallWatch(video);
+      sectionStats.videos += 1;
       const next = pendingVideos()[0];
       if (next) {
         playVideo(next);
@@ -2037,6 +2270,7 @@
     try {
       const response = await chrome.runtime.sendMessage({ type: "AI_REQUEST", questions: payload });
       if (!response?.ok) throw new Error(response?.error || "AI 接口没有返回结果");
+      noteAiSuccess();
       const localFilled = applyAnswers(questions, response.answers);
       let filledCount = localFilled;
       // 学习通新版作业页：孤立世界的文本写入会被页面回滚，把空值交给主世界重写，再按实时 DOM 终审
@@ -2074,6 +2308,39 @@
           ...audit.report
         ];
       }
+      // 没填上的题单独再问一次：只发这几题，并把上一轮失败原因带回去（选项原文对不上这类情况 AI 自己看不到）
+      const retryable = lastFillReport
+        // applyAnswers 的失败条目没有 ok 字段（只有 q/type/reason），所以按「不是成功」判定
+        .filter((record) => record && record.ok !== true && Number.isInteger(record.q) && record.q >= 0
+          && /匹配不上|回读为空|部分空|没有可回填|题号不存在/.test(record.reason || ""))
+        .slice(0, 5);
+      if (settings.retryUnfilled !== false && retryable.length && retryable.length <= 5) {
+        const subset = retryable.map((record) => questions[record.q]).filter(Boolean);
+        const reasons = new Map(retryable.map((record) => [record.q, record.reason]));
+        updateTask(taskId, { state: "running", detail: `${filledCount}/${questions.length} 已填，正在重问 ${subset.length} 道` });
+        publishStatus({ phase: "answering", filledCount, message: `正在重问 ${subset.length} 道没填上的题` });
+        logEvent("quiz", `重问 ${subset.length} 道未填上的题：${retryable.map((record) => `Q${record.q + 1}`).join("、")}`);
+        try {
+          const retryResponse = await chrome.runtime.sendMessage({
+            type: "AI_REQUEST",
+            questions: subset.map((question, offset) => ({
+              ...question.payload,
+              hint: `上一轮这道题没能填上：${reasons.get(retryable[offset].q) || "写入失败"}。请只依据题干和选项给出与选项原文完全一致的答案。`
+            }))
+          });
+          if (retryResponse?.ok) {
+            const retryFilled = applyAnswers(subset, retryResponse.answers || []);
+            filledCount = Math.min(questions.length, filledCount + retryFilled);
+            logEvent("quiz", `重问补上 ${retryFilled}/${subset.length} 道`);
+          } else {
+            logEvent("quiz", `重问未成功：${retryResponse?.error || "AI 没有返回结果"}`);
+          }
+        } catch (retryError) {
+          logEvent("quiz", `重问异常：${retryError.message}`);
+        }
+      }
+      rememberFailedQuestions(lastFillReport.map((record) => ({ ...record, stem: questions[record.q]?.payload?.stem || "" })));
+      sectionStats.questions += filledCount;
       lastQuizFingerprint = fingerprint;
 
       // 交卷是最终动作：普通章节测验是否提交完全由用户的「普通题提交」开关决定；
@@ -2100,6 +2367,7 @@
       return { ok: true, questionCount: questions.length, filledCount };
     } catch (error) {
       console.error("[玥玥刷客] AI 答题失败：", error);
+      noteAiFailure(error.message);
       publishStatus({ phase: "error", questionCount: questions.length, message: `AI 答题失败：${error.message}` });
       updateTask(taskId, { state: "error", detail: error.message });
       return { ok: false, error: error.message };
@@ -2190,6 +2458,12 @@
     try {
       if (guardCaptcha()) return;
       if (handleIncompleteTaskDialog()) return;
+      checkStall();
+      if (aiRetryNotBefore && Date.now() < aiRetryNotBefore) {
+        const waitSeconds = Math.ceil((aiRetryNotBefore - Date.now()) / 1000);
+        publishStatus({ phase: "error", message: `AI 接口连续失败，${waitSeconds} 秒后自动重试（可先在「模型设置」里测试接口）` });
+        return;
+      }
       const stored = await chrome.storage.local.get("aiConfig");
       const aiConfig = buildAiConfig(stored.aiConfig || {});
       const questions = await extractQuestions(aiConfig);
@@ -2230,9 +2504,22 @@
         suspendVideoForQuiz = false;
         publishStatus({ phase: "playing", message: "题目已处理，正在恢复视频播放" });
       }
-      if (!blockingVideoQuiz && pendingVideos().length) await playVideo(pendingVideos()[0]);
+      if (!blockingVideoQuiz && pendingVideos().length && !userStopped) {
+        const target = pendingVideos()[0];
+        await playVideo(target);
+        if (!target.paused && !target.ended) watchPlayback(target); else clearStallWatch();
+      } else {
+        clearStallWatch();
+      }
+      const courseProgress = readCourseProgress();
+      syncSectionContext(courseProgress?.chapter || "");
+      publishStatus({
+        courseProgress,
+        sectionStats: { videos: sectionStats.videos, questions: sectionStats.questions, elapsed: Date.now() - sectionStats.startedAt }
+      });
     } catch (error) {
       publishStatus({ phase: "error", message: `实时任务检测失败：${error.message}` });
+      logEvent("error", `调度失败：${error.message}`);
     } finally {
       orchestratorRunning = false;
     }
