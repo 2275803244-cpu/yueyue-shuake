@@ -81,7 +81,12 @@
   let stallWatch = null;
   const STALL_AFTER_MS = 90000;
   const STALL_GIVEUP_MS = 180000;
+  let idleDetectSince = 0;
+  let idleDetectedNotified = false;
+  let idleCheckTimer;
+  const IDLE_DETECT_MS = 60000;
   let lastCountSignature = "";
+  let lastTaskSummary = "";
   let lastPublishedSignature = "";
   const taskMap = new Map();
   let floatingUi;
@@ -134,7 +139,7 @@
     const next = { ...runtimeStatus, ...patch, updatedAt: Date.now() };
     const signature = JSON.stringify([
       next.phase, next.message, next.videoCount, next.documentCount, next.questionCount, next.filledCount,
-      next.courseProgress?.done, next.courseProgress?.chapter,
+      next.courseProgress?.done, next.courseProgress?.chapter, next.taskSummary, next.nothingDetected,
       next.sectionStats?.videos, next.sectionStats?.questions, Math.floor((next.sectionStats?.elapsed || 0) / 10000),
       (next.tasks || []).map((task) => [task.id, task.state, task.detail])
     ]);
@@ -212,6 +217,13 @@
     floatingUi.courseStat.textContent = stats
       ? `本节 视频 ${stats.videos} · 答题 ${stats.questions} · ${formatElapsed(stats.elapsed)}`
       : "";
+    const todoList = status.taskSummary || "";
+    const todoWarn = status.nothingDetected
+      ? "已启用 1 分钟仍没识别到任何任务：本节可能确实没有内容，也可能是没认出来。点「复制诊断」把信息发我。"
+      : "";
+    floatingUi.todo.classList.toggle("on", Boolean(todoList || todoWarn));
+    floatingUi.todoList.textContent = todoList;
+    floatingUi.todoWarn.textContent = todoWarn;
   }
 
   async function saveFloatingSetting(patch) {
@@ -277,6 +289,7 @@
         .status strong,.status small{display:block}.status small{margin-top:8px;overflow:hidden;color:var(--faint);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.status-count{display:flex;align-items:baseline;gap:1px;color:var(--faint);font-size:10px;font-weight:700}.status-count b{color:var(--ink);font-size:11.5px;font-variant-numeric:tabular-nums}.status-count span{font-variant-numeric:tabular-nums}
         .metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.metric{text-align:center;padding:9px 0 8px;border-right:1px solid var(--line);transition:background .15s}.metric:hover{background:var(--surface)}.metric:last-child{border:0}.metric span{display:block;color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.metric b{display:block;margin-top:3px;font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
         .course{display:flex;align-items:baseline;gap:6px;padding:0 2px 10px;color:var(--faint);font-size:9.5px}.course b{color:var(--dim);font-variant-numeric:tabular-nums}.course .c-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.course .c-stat{flex:none;font-variant-numeric:tabular-nums}
+        .todo{display:none;gap:3px;margin:-3px 2px 11px;padding:7px 8px;border-radius:8px;background:var(--surface);color:var(--dim);font-size:9.5px;line-height:1.5}.todo.on{display:grid}.todo .t-warn{color:var(--err)}
         .task-line{padding:0 2px 11px}.task-line .lab{color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.task-line .txt{margin-top:3px;color:var(--dim);font-size:10px;line-height:1.5}
         .master{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-radius:10px;background:var(--surface)}.master strong{font-size:11.5px;font-weight:700}.master small{display:block;margin-top:1px;color:var(--faint);font-size:9px}.switch{position:relative;width:36px;height:21px;flex:none}.switch input{position:absolute;opacity:0}.switch i{display:block;width:36px;height:21px;border-radius:99px;background:var(--track);transition:.2s}.switch i:after{content:'';position:absolute;top:3px;left:3px;width:15px;height:15px;border-radius:50%;background:var(--knob);box-shadow:0 1px 2px rgba(0,0,0,.2);transition:.2s}.switch input:checked+i{background:var(--on)}.switch input:checked+i:after{transform:translateX(15px)}
         .options{display:grid;grid-template-columns:1fr 1fr;gap:2px;margin-top:10px}.check{display:flex;align-items:center;gap:8px;min-height:30px;padding:5px 8px;border-radius:8px;color:var(--dim);font-size:10.5px;transition:color .15s,background .15s;cursor:pointer}.check:hover{color:var(--ink);background:var(--surface)}.check input{margin:0;flex:none;width:15px;height:15px;border-radius:5px;accent-color:var(--on)}.speed{display:flex;align-items:center;justify-content:space-between}.speed select{width:70px;padding:4px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);font-size:10px}
@@ -310,6 +323,7 @@
           </div>
           <div class="metrics"><span class="metric"><span>视频</span><b class="video-count">0</b></span><span class="metric"><span>课件</span><b class="document-count">0</b></span><span class="metric"><span>题目</span><b class="question-count">0</b></span></div>
           <div class="course"><b class="c-count">—</b><span class="c-name">课程进度</span><span class="c-stat"></span></div>
+          <div class="todo"><span class="t-list"></span><span class="t-warn"></span></div>
           <div class="task-line"><div class="lab">当前任务</div><div class="txt">暂无进行中的任务</div></div>
           <div class="master"><span><strong>启用当前站点</strong><small>开启后自动接管页面任务</small></span><label class="switch"><input class="enabled" type="checkbox"><i></i></label></div>
           <div class="options">
@@ -330,7 +344,7 @@
     floatingUi = {
       host, panel: find(".panel"), head: find(".head"), headLed: find(".led"), phaseChip: find(".phase-chip"), statusTitle: find(".status-title"), statusMessage: find(".status-message"), statusNow: find(".status-now"), statusTotal: find(".status-total"), progressFill: find(".progress-fill"),
       videoCount: find(".video-count"), documentCount: find(".document-count"), questionCount: find(".question-count"), activeTask: find(".task-line .txt"),
-      courseCount: find(".c-count"), courseName: find(".c-name"), courseStat: find(".c-stat"), stopButton: find(".stop"),
+      courseCount: find(".c-count"), courseName: find(".c-name"), courseStat: find(".c-stat"), todo: find(".todo"), todoList: find(".t-list"), todoWarn: find(".t-warn"), stopButton: find(".stop"),
       enabled: find(".enabled"), autoResume: find(".auto-resume"), autoReadDocuments: find(".auto-document"), autoAnswer: find(".auto-answer"), autoSubmit: find(".auto-submit"), autoNext: find(".auto-next"), skipCompleted: find(".skip-completed"), playbackRate: find(".rate"),
       customizer: find(".customizer"), customWidth: find(".custom-width"), customOpacity: find(".custom-opacity"), customOpacityValue: find(".opacity-value"), customCompact: find(".custom-compact"), modeButtons: [...shadow.querySelectorAll(".mode-btn")]
     };
@@ -400,6 +414,14 @@
         }
         if (stallWatch) lines.push(`看门狗：${stallWatch.recovered ? "已尝试恢复" : "未介入"}，停在 ${Math.floor(stallWatch.video?.currentTime || 0)} 秒`);
         if (userStopped) lines.push("用户已手动停止本节");
+        const diagTasks = readChapterTasks();
+        if (diagTasks) {
+          lines.push(`本节任务点 ${diagTasks.done}/${diagTasks.total}（${diagTasks.chapter || "未命名章节"}）：`);
+          for (const item of diagTasks.pending) lines.push(`  未完成：${item}`);
+        } else {
+          lines.push("任务点清单：没读到（左侧目录里没有活动章节或任务点）");
+        }
+        if (idleDetectedNotified) lines.push("启用后 1 分钟仍未识别到任何任务");
         let totalQuestions = 0;
         for (const item of result?.results || []) {
           const frame = item?.response;
@@ -787,6 +809,113 @@
     const minutes = Math.floor(total / 60);
     if (minutes < 60) return `${String(minutes).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
     return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+  }
+
+  // ---------- v3.9.1：检测更准（还剩什么没做 / 没识别到就说清楚） ----------
+  // 判断一个任务点是什么类型：只认图标/类名里的证据，认不出就返回空字符串
+  function detectTaskKind(node, name) {
+    const icon = node.querySelector?.("[class*='icon'], i, em");
+    const signature = normalizeText(`${node.className || ""} ${icon?.className || ""} ${icon?.textContent || ""}`);
+    if (/视频|video|play/i.test(signature)) return "视频";
+    // 测验要排在文档前面：「章节测验」不是课件
+    if (/作业|测验|考试|答题|实验|quiz|work|exam|test/i.test(signature)) return "测验";
+    if (/文档|资料|课件|章节|document|pdf|read/i.test(signature)) return "课件";
+    if (/视频/.test(name)) return "视频";
+    if (/作业|测验|考试|答题|实验/.test(name)) return "测验";
+    if (/课件|文档|资料|章节/.test(name)) return "课件";
+    return "";
+  }
+
+  // 完成状态只认「明确的完成标记」，没有标记就返回 null（未知），绝不用「没看到未完成」当成已完成
+  function detectTaskFinished(node, name) {
+    const finishedSelector = ".ans-job-finished, .jobFinished, .jobFinish, .task-point-finished, [data-task-status='completed'], [data-status='finished'], [class*='finished']";
+    const unfinishedSelector = ".ans-job-unfinished, .jobUnfinished, .jobUnfinish, .jobUnfinishCount, .orangeNew, [data-task-status='unfinished'], [data-status='incomplete'], [class*='unfinish']";
+    if (node.matches?.(unfinishedSelector) || node.querySelector?.(unfinishedSelector)) {
+      if (/已完成/.test(name) && !/未完成/.test(name)) {
+        // 同时出现完成与未完成标记（平台把图标和数字放在同一行）时，以文字为准
+        return !/未完成|待完成|未学习/.test(name);
+      }
+      return false;
+    }
+    if (node.matches?.(finishedSelector) || node.querySelector?.(finishedSelector)) return true;
+    if (/未完成|待完成|未学习/.test(name)) return false;
+    if (/已完成|√|✓|100%/.test(name)) return true;
+    return null;
+  }
+
+  // 当前章节还有哪些任务点没做。只有顶层 frame 能读到左侧目录。
+  function readChapterTasks() {
+    if (window !== window.top) return null;
+    let active = null;
+    try {
+      active = document.querySelector(".posCatalog_select.posCatalog_active") || document.querySelector(".posCatalog_active");
+    } catch {
+      return null;
+    }
+    if (!active) return null;
+    const chapter = normalizeText(active.querySelector(".posCatalog_name")?.textContent || active.textContent || "").slice(0, 20);
+    let rows = [...active.querySelectorAll(".posCatalog_select")];
+    if (!rows.length) {
+      // 任务点也可能平铺在活动章节旁边（部分课程把子节点渲染成同级）
+      const siblings = active.parentElement ? [...active.parentElement.querySelectorAll(".posCatalog_select")] : [];
+      const index = siblings.indexOf(active);
+      if (index >= 0) {
+        const owner = siblings[index + 1];
+        if (owner && !owner.classList.contains("posCatalog_active")) {
+          rows = owner.querySelectorAll(".posCatalog_select").length
+            ? [...owner.querySelectorAll(".posCatalog_select")]
+            : [...siblings.slice(index + 1).filter((node) => detectTaskKind(node, normalizeText(node.textContent || "")))];
+        }
+      }
+    }
+    const items = rows
+      .map((node) => {
+        const label = normalizeText(node.querySelector(".posCatalog_name")?.textContent || node.textContent || "").slice(0, 24);
+        return { label, kind: detectTaskKind(node, label), finished: detectTaskFinished(node, label) };
+      })
+      .filter((item) => item.label);
+    if (!items.length) return null;
+    return {
+      chapter,
+      total: items.length,
+      done: items.filter((item) => item.finished === true).length,
+      unknown: items.filter((item) => item.finished === null).length,
+      pending: items.filter((item) => item.finished === false).map((item) => `${item.kind || "任务"}·${item.label}`),
+      // 只有每个任务点都有明确完成标记才算全部完成，缺标记一律不当成完成
+      allFinished: items.every((item) => item.finished === true)
+    };
+  }
+
+  function summarizeChapterTasks(tasks) {
+    if (!tasks) return "";
+    if (tasks.pending.length) {
+      const head = tasks.pending.slice(0, 3).join("、");
+      const more = tasks.pending.length > 3 ? ` 等 ${tasks.pending.length} 项` : "";
+      return `本节 ${tasks.pending.length} 个任务点未完成：${head}${more}`;
+    }
+    if (tasks.unknown) return `本节 ${tasks.done}/${tasks.total} 个任务点已完成，${tasks.unknown} 个状态没认出来`;
+    return `本节 ${tasks.total} 个任务点已全部完成`;
+  }
+
+  // 已启用却一直什么都没识别到：要能分清「本节确实没内容」和「我没认出来」
+  function trackNothingDetected(found) {
+    if (found || !settings.enabled) {
+      idleDetectSince = 0;
+      idleDetectedNotified = false;
+      clearTimeout(idleCheckTimer);
+      idleCheckTimer = undefined;
+      return;
+    }
+    if (!idleDetectSince) {
+      idleDetectSince = Date.now();
+      clearTimeout(idleCheckTimer);
+      idleCheckTimer = setTimeout(() => { idleCheckTimer = undefined; if (settings.enabled) scan(); }, IDLE_DETECT_MS + 500);
+      return;
+    }
+    if (idleDetectedNotified || Date.now() - idleDetectSince < IDLE_DETECT_MS) return;
+    idleDetectedNotified = true;
+    logEvent("detect", "启用后 1 分钟仍未识别到任何任务");
+    publishStatus({ phase: "idle", nothingDetected: true });
   }
 
   function toggleStopSection() {
@@ -2377,8 +2506,14 @@
   }
 
   function detectCompletedTask() {
+    const tasks = readChapterTasks();
+    // 任务点清单是最硬的证据：每个任务点都带完成标记才算整节完成
+    if (tasks?.allFinished) return { complete: true, reason: `本节 ${tasks.total} 个任务点均已完成`, source: "task-list" };
     const pageText = normalizeText(document.body?.innerText || "");
-    const explicitText = pageText.match(/(?:本节|本任务点|任务点|当前任务|答题|测验)(?:已经|已)?完成|提交成功|已交卷|查看解析/);
+    // 清单里还有未完成任务点时，页面上的零散「完成」字样不算数（多半是别的章节的提示）
+    const explicitText = tasks?.pending.length
+      ? null
+      : pageText.match(/(?:本节|本任务点|任务点|当前任务|答题|测验)(?:已经|已)?完成|提交成功|已交卷|查看解析/);
     if (explicitText) {
       return { complete: true, reason: explicitText[0], source: "text" };
     }
@@ -2513,8 +2648,10 @@
       }
       const courseProgress = readCourseProgress();
       syncSectionContext(courseProgress?.chapter || "");
+      const chapterTasks = readChapterTasks();
       publishStatus({
         courseProgress,
+        taskSummary: summarizeChapterTasks(chapterTasks),
         sectionStats: { videos: sectionStats.videos, questions: sectionStats.questions, elapsed: Date.now() - sectionStats.startedAt }
       });
     } catch (error) {
@@ -2552,12 +2689,17 @@
       detail: settings.enabled ? `发现 ${videos.length} 个视频、${documentCount} 个课件，持续检测题目` : "站点未启用"
     });
     const countSignature = `${videos.length}:${documentCount}:${settings.enabled}`;
-    if (countSignature !== lastCountSignature) {
+    const chapterTasks = settings.enabled ? readChapterTasks() : null;
+    const taskSummary = summarizeChapterTasks(chapterTasks);
+    trackNothingDetected(videos.length + documentCount + Number(runtimeStatus.questionCount || 0) > 0);
+    if (countSignature !== lastCountSignature || taskSummary !== lastTaskSummary) {
       lastCountSignature = countSignature;
+      lastTaskSummary = taskSummary;
       publishStatus({
         phase: settings.enabled ? (videos.length ? "playing" : "scanning") : "idle",
         videoCount: videos.length,
         documentCount,
+        taskSummary,
         message: settings.enabled ? `检测到 ${videos.length} 个视频、${documentCount} 个课件，正在监听页面任务` : "当前站点已暂停"
       });
     }
