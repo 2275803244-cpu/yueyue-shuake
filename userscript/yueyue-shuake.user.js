@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.8.2
+// @version      3.8.3
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
 // @match        *://*.chaoxing.com/*
@@ -1502,6 +1502,7 @@
   let peerActiveFrame = "";
   let peerPendingTotal = 0;
   let playbackStateReportedAt = 0;
+  let captchaPaused = false;
 
   // 跨 frame 播放协调：iframe 各自上报视频进度，顶层只允许一个 frame 同时播放，
   // 并汇总“是否还有未看完的视频”，避免多个 iframe 互相抢播或提前跳章。
@@ -1571,6 +1572,61 @@
 
   function locallyPlaying() {
     return [...document.querySelectorAll("video")].some((video) => !video.paused && !video.ended);
+  }
+
+  // 平台偶尔会弹验证码（如“（9010）操作异常，请输入图片中的验证码”）。
+  // 这里只负责发现并停手，绝不代填、绝不绕过：暂停全部自动操作，等用户手动完成后自动恢复。
+  const CAPTCHA_CONTROL_SELECTORS = [
+    "img[src*='captcha' i]",
+    "img[src*='yanzhengma' i]",
+    "img[src*='validate' i]",
+    "input[name*='captcha' i]",
+    "input[id*='captcha' i]",
+    "input[placeholder*='验证码']",
+    ".captcha",
+    "[class*='captcha' i]",
+    "[id*='captcha' i]"
+  ];
+  // 不用“验证码”三个字单独判断——题库文案里也可能出现；只认明确的风险提示
+  const CAPTCHA_HINT_RE = /(?:操作异常|安全验证|异常验证|请输入图片中的|请输入图中的|请依次点击|按序点击|看不清.{0,12}换一[张张]|拖动.{0,12}滑块)/;
+  function detectCaptcha() {
+    for (const selector of CAPTCHA_CONTROL_SELECTORS) {
+      try {
+        const hit = [...document.querySelectorAll(selector)].find((element) => isUsable(element));
+        if (hit) return "页面出现验证码";
+      } catch {}
+    }
+    const text = normalizeText(document.body?.innerText || "");
+    const hint = text.match(CAPTCHA_HINT_RE);
+    return hint ? hint[0] : "";
+  }
+
+  function pauseForCaptcha(reason) {
+    captchaPaused = true;
+    for (const video of document.querySelectorAll("video")) {
+      if (!video.paused && !video.ended) video.pause();
+    }
+    reportPlaybackState(false, true);
+    updateTask("captcha", { label: "平台验证", type: "system", state: "waiting", detail: "等待手动完成验证" });
+    publishStatus({ phase: "paused", message: `检测到平台验证（${reason}），已暂停自动操作，请手动完成验证` });
+  }
+
+  function resumeAfterCaptcha() {
+    captchaPaused = false;
+    updateTask("captcha", { label: "平台验证", type: "system", state: "done", detail: "已手动完成" });
+    publishStatus({ phase: "playing", message: "验证已完成，继续自动学习" });
+  }
+
+  // 返回 true 表示当前被验证码挡住，调用方应直接停手
+  function guardCaptcha() {
+    if (!settings.enabled) return false;
+    const reason = detectCaptcha();
+    if (reason) {
+      if (!captchaPaused) pauseForCaptcha(reason);
+      return true;
+    }
+    if (captchaPaused) resumeAfterCaptcha();
+    return false;
   }
 
   function pendingVideos() {
@@ -1839,6 +1895,12 @@
 
   async function goNext() {
     if (!settings.enabled || !settings.autoNext || nextInProgress || pendingVideos().length) return;
+    if (captchaPaused) {
+      updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "平台验证码未完成，暂停跳转" });
+      clearTimeout(quizDeferredNextTimer);
+      quizDeferredNextTimer = setTimeout(() => goNext(), 1500);
+      return;
+    }
     if (pendingVideosAnywhere()) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "还有其他 frame 的视频未播放完成" });
       publishStatus({ phase: "playing", message: "还有其他视频未播放完成，继续学习" });
@@ -1974,6 +2036,7 @@
     if (!settings.enabled || orchestratorRunning || quizInFlight) return;
     orchestratorRunning = true;
     try {
+      if (guardCaptcha()) return;
       if (handleIncompleteTaskDialog()) return;
       const aiConfig = buildAiConfig();
       const questions = await extractQuestions(aiConfig);
@@ -2100,7 +2163,7 @@
   }
 
   function floatingPhaseLabel(phase) {
-    return { idle: "等待启动", scanning: "正在检测", playing: "视频学习中", reading: "课件阅读中", answering: "AI 正在答题", done: "本轮已完成", error: "需要处理" }[phase] || "正在运行";
+    return { idle: "等待启动", scanning: "正在检测", playing: "视频学习中", reading: "课件阅读中", answering: "AI 正在答题", done: "本轮已完成", error: "需要处理", paused: "需要手动验证" }[phase] || "正在运行";
   }
   function renderFloatingSettings() {
     if (!floatingUi) return;
@@ -2280,10 +2343,10 @@
         .panel[data-mode="dark"]{--ink:#f0f0f3;--dim:#a8a8b3;--faint:#6d6d78;--bg:#151517;--surface:#1c1c1f;--lift:#232327;--line:#2c2c31;--track:#26262b;--on:#f0f0f3;--knob:#151517;--go:#22c55e;--shadow:0 10px 32px rgba(0,0,0,.5)}
         .head{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:9px;padding:11px 12px;border-bottom:1px solid var(--line);background:var(--bg);cursor:grab;user-select:none;touch-action:none}.head:active{cursor:grabbing}
         .logo{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:var(--on);color:var(--knob);font-size:13px;font-weight:800}.title strong,.title small{display:block}.title strong{font-size:12.5px;font-weight:800;letter-spacing:.2px}.title small{margin-top:1px;color:var(--faint);font-size:9px}
-        .head-actions{display:flex;gap:2px;align-items:center}.led{width:6px;height:6px;border-radius:50%;background:var(--faint);margin:0 6px 0 2px;flex:none;transition:background .3s}.led.playing,.led.reading,.led.answering,.led.scanning{background:var(--go)}.led.done{background:var(--go)}.led.error{background:var(--err)}
+        .head-actions{display:flex;gap:2px;align-items:center}.led{width:6px;height:6px;border-radius:50%;background:var(--faint);margin:0 6px 0 2px;flex:none;transition:background .3s}.led.playing,.led.reading,.led.answering,.led.scanning{background:var(--go)}.led.done{background:var(--go)}.led.error,.led.paused{background:var(--err)}
         .icon-btn{display:grid;place-items:center;width:24px;height:24px;padding:0;border:0;border-radius:6px;color:var(--dim);background:transparent;transition:background .15s,color .15s}.icon-btn:hover{background:var(--surface);color:var(--ink)}
         .body{padding:12px}.panel.collapsed .body{display:none}.panel.collapsed{width:236px}.panel.collapsed .collapse svg{transform:rotate(180deg)}.icon-btn svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s}.body::-webkit-scrollbar{width:6px}.body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--faint) 40%,transparent);border-radius:99px}
-        .status{padding:1px 2px 11px}.status .row1{display:flex;align-items:center;justify-content:space-between}.phase-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:99px;background:var(--surface);color:var(--ink);font-size:10px;font-weight:700}.phase-chip i{width:6px;height:6px;border-radius:50%;background:var(--faint);transition:background .3s}.phase-chip.playing i,.phase-chip.reading i,.phase-chip.answering i,.phase-chip.scanning i{background:var(--go);animation:phasepulse 1.4s infinite}.phase-chip.done i{background:var(--go)}.phase-chip.error i{background:var(--err)}@keyframes phasepulse{50%{opacity:.45}}
+        .status{padding:1px 2px 11px}.status .row1{display:flex;align-items:center;justify-content:space-between}.phase-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:99px;background:var(--surface);color:var(--ink);font-size:10px;font-weight:700}.phase-chip i{width:6px;height:6px;border-radius:50%;background:var(--faint);transition:background .3s}.phase-chip.playing i,.phase-chip.reading i,.phase-chip.answering i,.phase-chip.scanning i{background:var(--go);animation:phasepulse 1.4s infinite}.phase-chip.done i{background:var(--go)}.phase-chip.error i,.phase-chip.paused i{background:var(--err)}@keyframes phasepulse{50%{opacity:.45}}
         .progress{height:3px;margin-top:9px;border-radius:99px;background:var(--track);overflow:hidden}.progress i{display:block;height:100%;border-radius:99px;background:var(--on);transition:width .4s ease}
         .status strong,.status small{display:block}.status small{margin-top:8px;overflow:hidden;color:var(--faint);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.status-count{display:flex;align-items:baseline;gap:1px;color:var(--faint);font-size:10px;font-weight:700}.status-count b{color:var(--ink);font-size:11.5px;font-variant-numeric:tabular-nums}.status-count span{font-variant-numeric:tabular-nums}
         .metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.metric{text-align:center;padding:9px 0 8px;border-right:1px solid var(--line);transition:background .15s}.metric:hover{background:var(--surface)}.metric:last-child{border:0}.metric span{display:block;color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.metric b{display:block;margin-top:3px;font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
