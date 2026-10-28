@@ -4,8 +4,19 @@
 
 ## 下载
 
-- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.9.1.zip](release/yueyue-shuake-v3.9.1.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
+- Chrome 扩展（推荐）：[release/yueyue-shuake-v3.9.2.zip](release/yueyue-shuake-v3.9.2.zip)，解压后按下面“安装”步骤加载即可；也可以克隆本仓库直接加载根目录。
 - 用户脚本版（脚本猫 / 油猴）：[userscript/yueyue-shuake.user.js](userscript/yueyue-shuake.user.js)，安装说明见 [userscript/README.md](userscript/README.md)。
+
+## 3.9.2 修复自动下一节自锁与坏答案缓存
+
+四个都是 3.7.9 起就存在、3.9.1 仍未修的问题，用无头浏览器 + 模拟章节测验页实测复现后修复。
+
+- **修复“任务点尚未完成”永久自锁**：`hasVisibleIncompleteTaskMarker()` 把页面上所有可见的 `.ans-job-icon` 都当成未完成（只看有没有 `.ans-job-finished` 类）。该图标在学习通每个任务点上都存在，平台若用改颜色等方式标记完成，判断就永远为真，`goNext()` 每 1.5 秒自我重排、始终不点下一节，浮窗一直显示“任务点尚未完成，暂不点击下一节”。现在只认平台明确写出的 `unfinished / incomplete` 标记，顶层与后台 `REQUEST_NEXT` 两处判据同步修改（3.9.1 新增的任务点清单判定不受影响）。
+- **修复坏答案被写进 7 天缓存**：`answerIsUsable` 对选择题只看 `choices.length > 0`，越界索引（三个选项却返回 `[7]`）也算可用。结果是既填不上题，又把坏答案缓存下来反复复用——再点“立即答题”连请求都不发。现在选择题答案至少要有一个 `choiceTexts` 与选项原文一致、或至少一个索引落在选项范围内；缓存读取、空题补问、缓存写入都用同一判据，缓存键同步升到 v6，旧缓存自动失效。
+- **修复题型识别漏读 `data` 属性**：学习通章节测验把题型写在容器自身的 `data="0/1/2/3"` 上（后台提交核验本来就是按它判断），`detectQuestionType` 此前只读 `answertype/typename/data-answer-type`，判断题与多选题型一律退化成单选，判断题的“对/错→正确/错误”归一化和应试提示词都没有生效。
+- **修复字体解码节流失效**：`cxEnsureDecoding` 的节流条件写成 `cxSecretMapping && ...`，映射为空（页面无混淆字体或识别失败）时每次调用都会重新解析全部 `@font-face`，而提取题目每秒都在跑。
+- 顺手去掉 `requestAnswers` 里未声明变量 `refilled` 造成的隐式全局。
+- 扩展版与脚本版同步；没有新增任何权限；交卷规则不变（默认不自动交卷）。
 
 ## 3.9.1 检测更准
 

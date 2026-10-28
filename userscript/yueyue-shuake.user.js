@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         玥玥刷客
 // @namespace    https://github.com/2275803244-cpu/yueyue-shuake
-// @version      3.9.1
+// @version      3.9.2
 // @description  网课学习助手：可拖动浮窗任务台，自动播放视频、阅读课件、切换下一节；接入 Chat Completions 格式的第三方 AI 接口自动答题（学习通章节测验/视频弹题适配，支持多空填空与富文本编辑器）。
 // @author       yueyue
 // @match        *://*.chaoxing.com/*
@@ -328,7 +328,8 @@
     if (!config.endpoint || !config.model) throw new Error("请先在浮窗“AI 设置”中填写接口地址和模型");
     const enhanceMode = config.enhanceMode !== false;
     // v5：否定题规则上线，旧版本缓存（含“章节测验”等垃圾答案）全部换键作废
-    const cacheKey = hashText(JSON.stringify({ v: 5, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, webSearch: config.webSearch !== false, questions }));
+    // v6：选择题可用性加入选项范围校验（v5 会把越界索引的坏答案锁进 7 天缓存），旧缓存全部换键作废
+    const cacheKey = hashText(JSON.stringify({ v: 6, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, webSearch: config.webSearch !== false, questions }));
     const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
     if (config.enableCache !== false) {
       const cache = store.get("answerCache", {}) || {};
@@ -353,7 +354,18 @@
       return parsed.answers.find((item) => Number(item?.question) === questionIndex) || parsed.answers[0] || null;
     };
 
-    // 答案是否真正可用：选择题要有 choices；文本题 textAnswers/textAnswer 至少一个非空
+    // 选择题答案是否真能落到页面：至少一个 choiceTexts 与选项原文一致，或至少一个索引在选项范围内。
+    // 旧规则只看 choices.length>0，越界索引（三个选项却返回 [7]）也算“可用”，既填不上题又会进 7 天缓存反复复用。
+    const choiceAnswerIsUsable = (question, answer) => {
+      const options = Array.isArray(question?.options) ? question.options.map(normalizeAnswerText).filter(Boolean) : [];
+      const choiceTexts = Array.isArray(answer?.choiceTexts) ? answer.choiceTexts.map(normalizeAnswerText).filter(Boolean) : [];
+      if (options.length && choiceTexts.some((text) => options.includes(text))) return true;
+      const indexes = Array.isArray(answer?.choices) ? answer.choices.map(Number).filter((value) => Number.isInteger(value)) : [];
+      if (!options.length) return indexes.length > 0;
+      return indexes.some((index) => index >= 0 && index < options.length);
+    };
+
+    // 答案是否真正可用：选择题要能对上选项；文本题 textAnswers/textAnswer 至少一个非空
     const answerIsUsable = (question, answer) => {
       if (!answer) return false;
       if (question.type === "text") {
@@ -363,7 +375,7 @@
         if (/^(?:章节|单元|课后|随堂|期中期末)(?:测验|测试|作业|考试|习题)\s*\d*$/.test(joined.trim())) return false;
         return true;
       }
-      return Array.isArray(answer.choices) && answer.choices.length > 0;
+      return choiceAnswerIsUsable(question, answer);
     };
 
     // 模型不一定按 schema 把文本答案写进 textAnswer/textAnswers：从常见杂牌字段里捞回来
@@ -477,10 +489,13 @@
       return question && question.type === "text" ? harvestTextAnswer(question, item) : item;
     });
 
-    ({ answers, refilled } = await retryUnanswered(questions, answers));
-    if (refilled) console.info(`[玥玥刷客] 空答案补问：${refilled} 题重新作答`);
+    const retryResult = await retryUnanswered(questions, answers);
+    answers = retryResult.answers;
+    if (retryResult.refilled) console.info(`[玥玥刷客] 空答案补问：${retryResult.refilled} 题重新作答`);
 
-    if (config.enableCache !== false) {
+    // 只缓存“每道题都能落到页面”的结果，避免往存储里堆永远命不中的条目
+    const allUsable = questions.every((question) => answerIsUsable(question, answers.find((item) => Number(item?.question) === Number(question.question))));
+    if (config.enableCache !== false && allUsable) {
       const cache = store.get("answerCache", {}) || {};
       cache[cacheKey] = { answers, model: config.model, at: Date.now() };
       const entries = Object.entries(cache).sort((a, b) => (b[1]?.at || 0) - (a[1]?.at || 0)).slice(0, 200);
@@ -1021,7 +1036,10 @@
   }
 
   async function cxEnsureDecoding(force = false) {
-    if (cxSecretMapping && !force && Date.now() - cxEnsureLastAt < CX_ENSURE_THROTTLE_MS) return cxSecretMapping;
+    // 节流对“没解出映射”的页面同样生效：此前条件写成 `cxSecretMapping && ...`，
+    // 映射为空（页面没有混淆字体、或识别失败）时每次调用都会重新解析全部 @font-face，
+    // 而提取题目每秒都在跑。
+    if (!force && Date.now() - cxEnsureLastAt < CX_ENSURE_THROTTLE_MS) return cxSecretMapping;
     if (cxEnsurePromise) return cxEnsurePromise;
     cxEnsureLastAt = Date.now();
     // 识别链路里任何一步卡死（canvas/字体解析/storage）都不许拖死答题：30 秒拿不到映射就按原文发送
@@ -1095,8 +1113,14 @@
   }
 
   function detectQuestionType(container) {
-    const typeValue = container.querySelector('input[id^="answertype"], input[name="answertype"], [data-answer-type]')?.value ||
+    const explicitType = container.querySelector('input[id^="answertype"], input[name="answertype"], [data-answer-type]')?.value ||
       container.getAttribute("typename") || container.getAttribute("data-answer-type") || "";
+    // 学习通章节测验把题型写在容器自身的 data="0/1/2/3" 上，这里必须同样读取，
+    // 否则判断题会退化成单选、多选只能靠 checkbox 兜。
+    const dataType = ["data", "data-type", "data-question-type"]
+      .map((name) => container.getAttribute?.(name))
+      .find((value) => value !== null && value !== undefined && /^[0-6]$/.test(String(value).trim()));
+    const typeValue = explicitType || dataType || "";
     const numericTypes = { "0": "single", "1": "multiple", "2": "text", "3": "judgement", "4": "text", "6": "text" };
     if (numericTypes[String(typeValue)]) return numericTypes[String(typeValue)];
     const typeText = normalizeText(container.querySelector(".newZy_TItle, .Zy_TItle, .colorShallow")?.textContent || typeValue);
@@ -2163,7 +2187,9 @@
     return true;
   }
   function hasVisibleIncompleteTaskMarker() {
-    const selectors = [".ans-job-icon", ".ans-job-unfinished", "[data-task-status='unfinished']", "[data-status='incomplete']"];
+    // 只认平台明确写出的“未完成”标记。`.ans-job-icon` 只是“这里有任务点”的黄点图标，
+    // 完成状态未必体现在类名上（平台可能只改颜色），把它当未完成会让 goNext 永久自锁。
+    const selectors = [".ans-job-unfinished", "[data-task-status='unfinished']", "[data-status='incomplete']"];
     return selectors.some((selector) => [...document.querySelectorAll(selector)].some((element) => {
       if (!isUsable(element)) return false;
       const finished = element.matches(".ans-job-finished, .jobFinished, .jobFinish, [data-task-status='completed'], [data-status='finished']") ||
@@ -2445,8 +2471,15 @@
 
   function scheduleOrchestrator() {
     if (!settings.enabled) return;
-    clearTimeout(orchestratorTimer);
-    orchestratorTimer = setTimeout(orchestrate, 220);
+    // 修复「识别到多个任务却卡住不推进、界面一直刷新」：
+    // MutationObserver 带 200ms 节流，DOM 一有变化就触发 scan → 这里；原先每次 scan 都 clearTimeout 重设 220ms，
+    // 200ms 的抖动节奏快于 220ms 的倒计时，定时器永远走不完 → orchestrate 被饿死，任务停在原地不推进。
+    // 改成：已有排程就不再重排；触发后清空引用，让下一轮 scan 能重新排上一个干净的 220ms。
+    if (orchestratorTimer) return;
+    orchestratorTimer = setTimeout(() => {
+      orchestratorTimer = undefined;
+      orchestrate();
+    }, 220);
   }
 
   function scan() {

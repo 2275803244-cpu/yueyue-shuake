@@ -226,7 +226,26 @@ async function chatCompletion(config, endpoint, headers, messages) {
     return parsed.answers.find((item) => Number(item?.question) === questionIndex) || parsed.answers[0] || null;
   }
 
-  // 答案是否真正可用：选择题要有 choices；文本题 textAnswers/textAnswer 至少一个非空
+  // 选项原文归一化：去空白、去掉“A.”“①”这类序号前缀，用来判断 AI 的 choiceTexts 是否真能落到页面上
+  function normalizeOptionText(value) {
+    return String(value ?? "").replace(/\s+/g, " ").trim()
+      .replace(/^[A-ZＡ-Ｚ][.．、:：)）]\s*/i, "")
+      .replace(/^[①②③④⑤⑥⑦⑧⑨⑩]\s*/, "")
+      .trim();
+  }
+
+  // 选择题答案是否真能落到页面：至少一个 choiceTexts 与选项原文一致，或至少一个索引在选项范围内。
+  // 旧规则只看 choices.length>0，越界索引（三个选项却返回 [7]）也算“可用”，既填不上题又会进 7 天缓存反复复用。
+  function choiceAnswerIsUsable(question, answer) {
+    const options = Array.isArray(question?.options) ? question.options.map(normalizeOptionText).filter(Boolean) : [];
+    const choiceTexts = Array.isArray(answer?.choiceTexts) ? answer.choiceTexts.map(normalizeOptionText).filter(Boolean) : [];
+    if (options.length && choiceTexts.some((text) => options.includes(text))) return true;
+    const indexes = Array.isArray(answer?.choices) ? answer.choices.map(Number).filter((value) => Number.isInteger(value)) : [];
+    if (!options.length) return indexes.length > 0;
+    return indexes.some((index) => index >= 0 && index < options.length);
+  }
+
+  // 答案是否真正可用：选择题要能对上选项；文本题 textAnswers/textAnswer 至少一个非空
   function answerIsUsable(question, answer) {
     if (!answer) return false;
     if (question.type === "text") {
@@ -236,7 +255,7 @@ async function chatCompletion(config, endpoint, headers, messages) {
       if (/^(?:章节|单元|课后|随堂|期中期末)(?:测验|测试|作业|考试|习题)\s*\d*$/.test(joined.trim())) return false;
       return true;
     }
-    return Array.isArray(answer.choices) && answer.choices.length > 0;
+    return choiceAnswerIsUsable(question, answer);
   }
 
   // 模型不一定按 schema 把文本答案写进 textAnswer/textAnswers：从常见杂牌字段里捞回来
@@ -309,7 +328,8 @@ async function requestAnswers(questions) {
 
   const enhanceMode = config.enhanceMode !== false;
   // v5：否定题规则与选项归并修复上线，旧版本缓存（含乱码时代“章节测验”等垃圾答案）全部换键作废
-  const cacheKey = hashText(JSON.stringify({ v: 5, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, webSearch: config.webSearch !== false, questions }));
+  // v6：选择题可用性加入选项范围校验（v5 会把越界索引的坏答案锁进 7 天缓存），旧缓存全部换键作废
+  const cacheKey = hashText(JSON.stringify({ v: 6, model: config.model, systemPrompt: config.systemPrompt || "", enhanceMode, webSearch: config.webSearch !== false, questions }));
   const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
   if (config.enableCache !== false) {
     const cachedStore = await chrome.storage.local.get("answerCache");
@@ -411,10 +431,17 @@ async function requestAnswers(questions) {
     return question && question.type === "text" ? harvestTextAnswer(question, item) : item;
   });
 
-  ({ answers, refilled } = await retryUnanswered(config, endpoint, headers, questions, answers, pickAnswer));
-  if (refilled) console.info(`[玥玥刷客] 空答案补问：${refilled} 题重新作答`);
+  const retryResult = await retryUnanswered(config, endpoint, headers, questions, answers, pickAnswer);
+  answers = retryResult.answers;
+  if (retryResult.refilled) console.info(`[玥玥刷客] 空答案补问：${retryResult.refilled} 题重新作答`);
 
-  if (config.enableCache !== false) {
+  // 只缓存“每道题都能落到页面”的结果：整组里只要有一题不可用，读缓存时也会被判无效，
+  // 存下来只会在存储里堆垃圾条目。
+  const allUsable = questions.every((question) => {
+    const answer = answers.find((item) => Number(item?.question) === Number(question.question));
+    return answerIsUsable(question, answer);
+  });
+  if (config.enableCache !== false && allUsable) {
     const cachedStore = await chrome.storage.local.get("answerCache");
     const answerCache = cachedStore.answerCache || {};
     answerCache[cacheKey] = { answers, model: config.model, at: Date.now() };
@@ -820,7 +847,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return null;
         };
         const hasIncompleteTaskMarker = () => {
-          const selectors = [".ans-job-icon", ".ans-job-unfinished", "[data-task-status='unfinished']", "[data-status='incomplete']"];
+          // 与 content.js 保持一致：`.ans-job-icon` 只表示“这里有任务点”，完成与否未必体现在类名上，
+          // 拿它当未完成判据会永久拦住“下一节”。
+          const selectors = [".ans-job-unfinished", "[data-task-status='unfinished']", "[data-status='incomplete']"];
           return selectors.some((selector) => [...document.querySelectorAll(selector)].some((element) => {
             if (!usable(element)) return false;
             const finished = element.matches(".ans-job-finished, .jobFinished, .jobFinish, [data-task-status='completed'], [data-status='finished']") ||
