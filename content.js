@@ -1765,9 +1765,24 @@
     for (const selector of DOCUMENT_SELECTORS) {
       try { readers.push(...document.querySelectorAll(selector)); } catch {}
     }
-    const unique = readers.filter((reader, index, all) => all.indexOf(reader) === index && (isUsable(reader) || reader.tagName === "IFRAME"));
+    let unique = readers.filter((reader, index, all) => all.indexOf(reader) === index && (isUsable(reader) || reader.tagName === "IFRAME"));
     if (!unique.length && documentUrlLooksLikeReader()) unique.push(document.documentElement);
-    return unique;
+    // 防御：`[class*='insertdoc']` 这类宽选择器会把阅读器内部成百上千个同类节点都选中。
+    // 若全部当成“课件”，processDocuments 会挨个滚动（1500+ × 80 步）必然假死。只保留像阅读区的大块容器。
+    const looksLikeReaderBox = (element) => {
+      if (element === document.documentElement) return true;
+      try {
+        const rect = element.getBoundingClientRect();
+        return rect.width >= 200 && rect.height >= 200;
+      } catch { return false; }
+    };
+    unique = unique.filter(looksLikeReaderBox);
+    // 嵌套去重：一个容器包含另一个时只保留最外层，避免父/子节点被重复阅读
+    unique = unique.filter((element, _index, all) => !all.some((other) => other !== element && other.contains(element)));
+    // 兜底上限：即使选择器继续误匹配，也绝不超过 3 个，根治“课件 N 千、一路空转”的假死
+    return unique
+      .sort((left, right) => ((right.scrollHeight || 0) - (right.clientHeight || 0)) - ((left.scrollHeight || 0) - (left.clientHeight || 0)))
+      .slice(0, 3);
   }
 
   function readerRoot(reader) {
@@ -1844,6 +1859,8 @@
     }
     let pageClicks = 0;
     let stableAtEnd = 0;
+    let lastScrollSum = -1;
+    let idleSteps = 0;
     updateTask(taskId, { label, type: "document", state: "running", detail: "正在阅读并滚动课件" });
     publishStatus({ phase: "reading", message: "检测到教学课件，正在自动阅读", documentCount: findDocumentReaders().length });
 
@@ -1851,12 +1868,22 @@
       if (!reader.isConnected && reader !== document.documentElement) break;
       const result = scrollReaderToEnd(reader);
       if (!result.complete) {
+        // 滚了却没有实际位移：说明选到的容器根本滚不动（常见于把工具栏/固定层误当阅读区）。
+        // 连续几步仍不动就直接退出，别空转到 80 步后误报“超步”。
+        const scrollSum = result.targets.reduce((sum, target) => sum + (target.scrollTop || 0), 0);
+        idleSteps = scrollSum <= lastScrollSum ? idleSteps + 1 : 0;
+        lastScrollSum = scrollSum;
+        if (idleSteps >= 4) break;
         stableAtEnd = 0;
         updateTask(taskId, { state: "running", detail: `正在滚动课件 · ${step}/80` });
         await new Promise((resolve) => setTimeout(resolve, 550));
         continue;
       }
 
+      // 能滚到底/翻到下一页时，停滞计数清零——否则会带着上一页的 idleSteps，
+      // 让新页第一步就被误判成“滚不动”而提前退出
+      idleSteps = 0;
+      lastScrollSum = -1;
       const nextPage = findDocumentNextPageButton(reader);
       if (nextPage) {
         pageClicks += 1;
