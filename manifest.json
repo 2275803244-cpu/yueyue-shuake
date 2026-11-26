@@ -1,13 +1,35 @@
 {
   "manifest_version": 3,
   "name": "玥玥刷客",
-  "version": "3.9.4",
+  "version": "3.9.20",
   "description": "带可拖动网页浮窗、实时任务状态和第三方 AI 答题能力的网课学习助手。",
   "permissions": [
     "storage",
     "tabs",
     "scripting",
     "webNavigation"
+  ],
+  "host_permissions": [
+    "*://*.chaoxing.com/*",
+    "*://*.xuexitong.com/*",
+    "*://*.zhihuishu.com/*",
+    "*://*.changjietong.com/*",
+    "*://*.yuketang.cn/*",
+    "*://*.rainclassroom.com/*",
+    "*://*.icve.com.cn/*",
+    "*://*.icourse163.org/*",
+    "*://*.icourse163.cn/*",
+    "*://*.xuexi.cn/*",
+    "*://*.gxt.hnvcp.com/*",
+    "*://*.nodedu.cn/*",
+    "*://*.sflep.com/*",
+    "*://*.cnki.net/*",
+    "*://*.mosoteach.cn/*",
+    "*://*.mtcsun.com/*",
+    "*://*.xuanyaedu.com/*",
+    "*://*.classin.cn/*",
+    "*://*.eelive.cn/*",
+    "*://*.edu.cn/*"
   ],
   "optional_host_permissions": [
     "https://*/*",

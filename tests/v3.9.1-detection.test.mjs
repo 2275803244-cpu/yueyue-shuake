@@ -232,7 +232,9 @@ function testTopFrameOnly(target) {
 // ============================================================
 function testCompletionVerdict(target) {
   const { source, twin } = target;
-  const fn = ["detectTaskKind", "detectTaskFinished", "readChapterTasks", "detectCompletedTask"].map((name) => extractFunction(source, name)).join("\n");
+  const names = ["detectTaskKind", "detectTaskFinished", "readChapterTasks", "detectCompletedTask"];
+  if (!twin) names.push("platformCompletion");
+  const fn = names.map((name) => extractFunction(source, name)).join("\n");
   // 页面上有别的章节的「答题完成」字样，但本节还有没做的任务点 —— 不能被带跑
   const pending = makeCatalog([{ name: "1.1 视频", kindClass: "icon-video", finished: true }, { name: "1.2 作业", kindClass: "icon-work", unfinished: true }]);
   const sandbox = buildSandbox({
@@ -282,7 +284,10 @@ function testNothingDetected(target) {
   trackNothingDetected(false);
   clock = NOW + 261000;
   trackNothingDetected(false);
-  check(`${target.label}：重新计时，第二次沉默也要再提示`, sandbox.__published.length === 2, JSON.stringify(sandbox.__published.length));
+  // v3.9.20：认出内容时会额外 publishStatus({ nothingDetected: false }) 清除浮窗误报，
+  // 所以这里按「提示次数」计数，而不是按 publishStatus 调用总次数。
+  const silentNotices = sandbox.__published.filter((item) => item.nothingDetected === true).length;
+  check(`${target.label}：重新计时，第二次沉默也要再提示`, silentNotices === 2, JSON.stringify(sandbox.__published.length));
 
   // 站点没启用时不该计时
   sandbox.settings.enabled = false;
@@ -301,7 +306,9 @@ function testPanelWiring(target) {
   check(`${target.label}：浮窗节点已取到`, source.includes('todo: find(".todo")') && source.includes('todoList: find(".t-list")') && source.includes('todoWarn: find(".t-warn")'));
   check(`${target.label}：渲染时按有无内容开关`, /floatingUi\.todo\.classList\.toggle\("on"/.test(source) && /floatingUi\.todoWarn\.textContent = todoWarn/.test(source));
   check(`${target.label}：状态签名带上任务点摘要`, /next\.taskSummary, next\.nothingDetected/.test(source));
-  check(`${target.label}：扫描时刷新任务点摘要`, /taskSummary: summarizeChapterTasks\(chapterTasks\)/.test(source) && /trackNothingDetected\(videos\.length/.test(source));
+  // v3.9.20：trackNothingDetected 的实参拆成了多行（videos.length + documentCount + ...），
+  // 断言改为跨行匹配「以 videos.length 开头的一次调用」。
+  check(`${target.label}：扫描时刷新任务点摘要`, /taskSummary: summarizeChapterTasks\(chapterTasks\)/.test(source) && /trackNothingDetected\(\s*videos\.length/.test(source));
   check(`${target.label}：诊断里带任务点清单`, twin ? /diagnosis\.chapterTasks/.test(source) : /const diagTasks = readChapterTasks\(\)/.test(source));
   check(`${target.label}：没有新增任何权限`, !/optional_host_permissions"[\s\S]{0,200}v3\.9/.test(source) && (source.match(/https?:\/\/[^"' ]+/g) || []).length >= 0);
   check(`${target.label}：默认仍然不自动交卷`, /autoSubmit: false/.test(source));

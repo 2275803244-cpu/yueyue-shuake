@@ -1905,13 +1905,20 @@
 
   // 已启用却一直什么都没识别到：要能分清「本节确实没内容」和「我没认出来」
   function trackNothingDetected(found) {
+    // 子 frame 只负责清标记；「没识别到」只由顶层根据聚合结果发出，避免空 iframe 误报污染浮窗。
     if (found || !settings.enabled) {
       idleDetectSince = 0;
-      idleDetectedNotified = false;
+      if (idleDetectedNotified || runtimeStatus.nothingDetected) {
+        idleDetectedNotified = false;
+        publishStatus({ nothingDetected: false });
+      } else {
+        idleDetectedNotified = false;
+      }
       clearTimeout(idleCheckTimer);
       idleCheckTimer = undefined;
       return;
     }
+    if (window !== window.top) return;
     if (!idleDetectSince) {
       idleDetectSince = Date.now();
       clearTimeout(idleCheckTimer);
@@ -1919,6 +1926,14 @@
       return;
     }
     if (idleDetectedNotified || Date.now() - idleDetectSince < IDLE_DETECT_MS) return;
+    // 聚合计数或进行中任务已证明有内容时，禁止误报。
+    const activeTask = (runtimeStatus.tasks || []).some((task) => task.state === "running" || task.state === "error");
+    const hasContent = Number(runtimeStatus.videoCount || 0) + Number(runtimeStatus.documentCount || 0) + Number(runtimeStatus.questionCount || 0) > 0;
+    // 仅有 playing 相位、没有真实计数时不能当成有内容，否则空章节会永久自锁。
+    if (activeTask || hasContent) {
+      idleDetectSince = 0;
+      return;
+    }
     idleDetectedNotified = true;
     logEvent("detect", "启用后 1 分钟仍未识别到任何任务");
     publishStatus({ phase: "idle", nothingDetected: true });

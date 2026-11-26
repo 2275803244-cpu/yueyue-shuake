@@ -59,6 +59,9 @@ chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
   if (frameId === 0) {
     activeVideoQuizFrames.delete(tabId);
     frameStatusesByTab.delete(tabId);
+    // 顶层换页后，旧页面的视频与播放租约都不能继续拦截新页面。
+    playbackFramesByTab.delete(tabId);
+    activePlaybackByTab.delete(tabId);
     return;
   }
   const frames = activeVideoQuizFrames.get(tabId);
@@ -75,16 +78,30 @@ chrome.webNavigation.onCommitted.addListener(({ tabId, frameId }) => {
 });
 
 function aggregateFrameStatuses(statuses) {
+  const now = Date.now();
+  // 丢弃过期 frame 状态，避免空章节仍被旧 videoCount/playing 粘住。
+  for (const [frameId, item] of [...statuses.entries()]) {
+    if (!item || now - (item.updatedAt || 0) > PLAYBACK_STATE_TTL_MS) statuses.delete(frameId);
+  }
   const items = [...statuses.values()].map((item) => item.status).filter(Boolean);
   const priority = ["error", "answering", "playing", "reading", "scanning", "done", "idle"];
   const primary = priority.map((phase) => items.find((item) => item.phase === phase)).find(Boolean) || items[0] || {};
+  const videoCount = items.reduce((sum, item) => sum + Number(item.videoCount || 0), 0);
+  const documentCount = items.reduce((sum, item) => sum + Number(item.documentCount || 0), 0);
+  const questionCount = items.reduce((sum, item) => sum + Number(item.questionCount || 0), 0);
+  const tasks = items.flatMap((item) => item.tasks || []).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 20);
+  const hasActiveWork = videoCount + documentCount + questionCount > 0
+    || tasks.some((task) => task.state === "running" || task.state === "error")
+    || ((videoCount + documentCount + questionCount > 0) && /playing|reading|answering/.test(String(primary.phase || "")));
   return {
     ...primary,
-    videoCount: items.reduce((sum, item) => sum + Number(item.videoCount || 0), 0),
-    documentCount: items.reduce((sum, item) => sum + Number(item.documentCount || 0), 0),
-    questionCount: items.reduce((sum, item) => sum + Number(item.questionCount || 0), 0),
+    videoCount,
+    documentCount,
+    questionCount,
     filledCount: items.reduce((sum, item) => sum + Number(item.filledCount || 0), 0),
-    tasks: items.flatMap((item) => item.tasks || []).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 20),
+    tasks,
+    // 任一 frame 有内容/在干活时，禁止把空 iframe 的 nothingDetected 带进浮窗。
+    nothingDetected: !hasActiveWork && items.some((item) => item.nothingDetected),
     updatedAt: Date.now()
   };
 }
@@ -643,9 +660,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const items = [];
         for (const q of doc.querySelectorAll(".TiMu,.newTiMu")) {
           const qtype = String(q.getAttribute("data") || "");
-          const isChoice = qtype === "0" || qtype === "1";
-          const checked = [...q.querySelectorAll("span.check_answer, span.check_answer_dx")].some((s) => s.getAttribute("data"));
-          const blanks = [...q.querySelectorAll(".blankItemDiv, .Zy_ulTk > li")];
+          const hasChoiceInput = Boolean(q.querySelector("input[type='radio'], input[type='checkbox']"));
+          const isChoice = qtype === "0" || qtype === "1" || hasChoiceInput;
+          const highlighted = [...q.querySelectorAll("span.check_answer, span.check_answer_dx")].some((s) => s.getAttribute("data"));
+          const nativeChecked = [...q.querySelectorAll("input[type='radio'], input[type='checkbox']")].some((input) => input.checked);
+          const checked = highlighted || nativeChecked;
+          const blanks = [...q.querySelectorAll(".blankItemDiv, .Zy_ulTk > li")].filter((item) => item.querySelector("textarea, iframe"));
           const filledTexts = blanks.map(blankTextOf).filter(Boolean);
           if (isChoice) choiceQuestions += 1;
           items.push({ q, isChoice, checked, blanks, filledTexts });
@@ -676,25 +696,107 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!item.isChoice && item.blanks.length && !item.filledTexts.length) unansweredText += 1;
         }
       }
+      const buttonText = (element) => normalize(element.innerText || element.textContent || element.value || "");
+      const confirmInfo = () => {
+        const acceptText = /确定提交|确认提交|确认交卷|是否确认提交/;
+        const rejectText = /未作答|请选择|请作答|答题未完成|答完/;
+        const buttonPattern = /^(提交|提交答案|确定|确认|确认提交|确认交卷)$/;
+        // 学习通专用确认框：#workpop 可见时，#popok 就是确认按钮。
+        // 该按钮文字由脚本动态填充，可能读不到「提交」，必须按 id 识别。
+        const workpop = document.querySelector("#workpop");
+        if (workpop && usable(workpop)) {
+          const content = normalize(document.querySelector("#popcontent")?.innerText || document.querySelector("#popcontent")?.textContent || workpop.innerText || "");
+          if (rejectText.test(content) && !acceptText.test(content)) {
+            return { status: "blocked", message: content.slice(0, 100) };
+          }
+          const ok = document.querySelector("#popok");
+          if (usable(ok) && (/提交|交卷|确认|确定/.test(content) || acceptText.test(content))) {
+            return { status: "clicked", button: ok, message: content.slice(0, 100) };
+          }
+        }
+        const dialogs = [...document.querySelectorAll(
+          "#popok, [role=dialog], [role=alertdialog], .layui-layer-dialog, .layui-layer, .el-message-box, .modal, .dialog, .x-window, .x-message-box, [class*='dialog'], [class*='modal'], [class*='confirm'], [class*='popup']"
+        )].filter(usable);
+        for (const dialog of dialogs.reverse()) {
+          const text = normalize(dialog.innerText || dialog.textContent || "");
+          if (!text) continue;
+          if (rejectText.test(text) && !acceptText.test(text)) {
+            return { status: "blocked", message: text.slice(0, 100) };
+          }
+          if (!/提交|交卷|确认|确定/.test(text)) continue;
+          const buttons = [...dialog.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]")]
+            .filter((element) => usable(element) && buttonPattern.test(buttonText(element)));
+          if (buttons.length) return { status: "clicked", button: buttons[buttons.length - 1], message: text.slice(0, 100) };
+          return { status: "missing", message: text.slice(0, 100) };
+        }
+        // 不依赖弹窗 class：从“提交”按钮向上找最近包含确认文案的容器。
+        const allButtons = [...document.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]")]
+          .filter((element) => usable(element) && buttonPattern.test(buttonText(element)));
+        for (const button of allButtons.reverse()) {
+          let node = button.parentElement;
+          for (let depth = 0; node && node !== document.body && depth < 9; depth += 1, node = node.parentElement) {
+            const text = normalize(node.innerText || node.textContent || "");
+            if (text.length <= 300 && acceptText.test(text)) return { status: "clicked", button, message: text.slice(0, 100) };
+          }
+        }
+        return { status: "none" };
+      };
       const originalAlert = globalThis.alert;
       globalThis.alert = () => {};
       let method = "";
       try {
-        if (typeof globalThis.btnBlueSubmit === "function") {
-          await Promise.resolve(globalThis.btnBlueSubmit());
+        // The submit control can live in a sibling iframe, not the frame that
+        // sent CHAOXING_SUBMIT. Search every same-origin document collected above.
+        const windowWith = (name) => {
+          for (const d of docs) { const w = d.defaultView; if (w && typeof w[name] === "function") return w; }
+          return null;
+        };
+        const blueWin = windowWith("btnBlueSubmit");
+        if (blueWin) {
+          await Promise.resolve(blueWin.btnBlueSubmit());
           method = "btnBlueSubmit";
         } else {
-          const submit = document.querySelector(".btnBlueSubmit, [onclick*='btnBlueSubmit'], [onclick*='submitAnswer'], .submit-answer, button[type=submit]") ||
-            findTextButton(/^(提交|提交答案|完成|交卷)$/);
-          if (!usable(submit)) return { ok: false, error: "没有找到学习通提交入口" };
-          submit.click();
-          method = "button";
+          let submit = null;
+          const submitText = (e) => String(e.innerText || e.textContent || e.value || "").replace(/\s+/g, "");
+          const badText = /保存|暂存|返回|上一步|取消|重做/;
+          for (const d of docs) {
+            submit = d.querySelector(".btnBlueSubmit, .btnSubmit, .submitBtn, #submitBtn, [onclick*='btnBlueSubmit'], [onclick*='submitAnswer'], [onclick*='submitWork'], [onclick*='submitPaper'], .submit-answer, button[type=submit], input[type=submit], input[value*='提交'], input[value*='交卷']") ||
+              [...d.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]")]
+                .find((e) => usable(e) && /^(提交|提交答案|提交作业|完成|交卷|确认提交)$/.test(submitText(e)) && !badText.test(submitText(e)));
+            if (submit && usable(submit)) break;
+          }
+          if (!submit || !usable(submit)) {
+            // 兜底：直接调用页面同源提交函数（有的作业页把提交写在全局函数里）
+            let called = false;
+            for (const name of ["submitAnswer", "submitWork", "btnBlueSubmit", "submitPaper", "submitHomework"]) {
+              const w = windowWith(name);
+              if (w) {
+                try { await Promise.resolve(w[name]()); called = true; method = `fn:${name}`; break; } catch {}
+              }
+            }
+            if (!called) return { ok: false, error: "没有找到学习通提交入口" };
+          } else {
+            submit.click();
+            method = "button";
+          }
         }
         await new Promise((resolve) => setTimeout(resolve, 1200));
-        if (typeof globalThis.submitCheckTimes === "function") {
-          await Promise.resolve(globalThis.submitCheckTimes());
-        } else {
-          findTextButton(/^(确定|确认|确认提交)$/)?.click();
+        const checkWin = windowWith("submitCheckTimes");
+        if (checkWin) await Promise.resolve(checkWin.submitCheckTimes());
+        // 平台可能再弹「提示 / 确认提交？」。先读文案：未作答类直接停手，只有确认提交类才点确认。
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const confirm = confirmInfo();
+        if (confirm.status === "blocked") {
+          return { ok: false, blocked: true, error: `平台拒绝提交：${confirm.message}`, method };
+        }
+        if (confirm.status === "missing") {
+          // content.js searches confirm dialogs across frames after this call.
+          return { ok: true, method, note: `确认弹窗不在本帧：${confirm.message}` };
+        }
+        if (confirm.status === "clicked") {
+          confirm.button.click();
+          method += "+confirm";
+          await new Promise((resolve) => setTimeout(resolve, 700));
         }
         const notes = [];
         if (unansweredChoice) notes.push(`${unansweredChoice} 道选择/多选题未选中`);
@@ -710,7 +812,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     };
     chrome.scripting.executeScript({
-      target: { tabId: sender.tab.id, frameIds: [sender.frameId ?? 0] },
+      // Run in the main frame so collectDocs() can reach every nested course
+      // iframe; the quiz frame itself cannot see sibling/parent submit controls.
+      target: { tabId: sender.tab.id, frameIds: [0] },
       world: "MAIN",
       func: submitExecutor
     }).then((results) => sendResponse(results?.[0]?.result || { ok: false, error: "学习通提交没有返回结果" }))
@@ -809,6 +913,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (error.permissionNeeded) sendResponse({ ok: false, error: error.message, permissionNeeded: error.permissionNeeded });
         else sendResponse({ ok: false, error: error.message });
       });
+    return true;
+  }
+
+  if (message?.type === "GET_CX_STATE" && sender.tab?.id) {
+    // 学习通把当前章节任务点写在顶层页面的 attachments / mArg 里。
+    // 从 MAIN world 读取平台自己的完成数据，避免只靠 DOM 猜任务状态。
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, allFrames: true },
+      world: "MAIN",
+      func: () => {
+        try {
+          const read = () => {
+            if (Array.isArray(globalThis.attachments) && globalThis.attachments.length) return globalThis.attachments;
+            const match = document.body?.innerHTML?.match(/try\s*\{\s*mArg\s*=\s*(\{[\s\S]*?\})\s*;\s*\}/);
+            if (match) {
+              try {
+                const parsed = JSON.parse(match[1]);
+                if (Array.isArray(parsed?.attachments)) return parsed.attachments;
+              } catch {}
+            }
+            return [];
+          };
+          const attachments = read();
+          const tasks = attachments.map((attachment, index) => {
+            const property = attachment?.property || {};
+            const jobid = String(attachment?.jobid || property._jobid || "");
+            const mid = String(property.mid || "");
+            return {
+              index,
+              jobid,
+              mid,
+              module: String(property.module || ""),
+              name: String(property.name || property.title || property.bookname || ""),
+              job: Boolean(attachment?.job),
+              isPassed: Boolean(attachment?.isPassed),
+              studyTotal: Number(attachment?.studytotal || attachment?.studyTotal || property.studytotal || property.studyTotal || 0) || 0,
+              duration: Number(attachment?.duration || property.duration || 0) || 0
+            };
+          }).filter((task) => task.jobid || task.mid);
+          return { ok: true, href: location.href, tasks };
+        } catch (error) {
+          return { ok: false, error: error.message, tasks: [] };
+        }
+      }
+    }).then((results) => {
+      const rows = (results || []).map((item) => item?.result).filter(Boolean);
+      const best = rows.find((row) => Array.isArray(row.tasks) && row.tasks.length) || rows[0] || { ok: false, tasks: [] };
+      sendResponse(best);
+    }).catch((error) => sendResponse({ ok: false, error: error.message, tasks: [] }));
     return true;
   }
 

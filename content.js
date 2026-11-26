@@ -53,9 +53,17 @@
   let nextInProgress = false;
   let intentionalPauseUntil = 0;
   let quizInFlight = false;
-  let documentInFlight = false;
-  let documentCompletionTimer;
   const completedDocumentReaders = new Set();
+  // 单任务执行器：同一 frame 同一时间只推进一个任务，翻页只由队列耗尽后的统一入口发起。
+  let activeJob = null;
+  let readyForNavigation = false;
+  let forceNextAfterFailure = false;
+  const ignoredVideos = new WeakSet();
+  const failedDocumentReaders = new Set();
+  const ignoredQuizFingerprints = new Set();
+  const completedQuizJobs = new Set();
+  const VIDEO_JOB_STALL_MS = 180000;
+  const MAX_QUIZ_JOB_ATTEMPTS = 3;
   let completionSignature = "";
   let completionStableCount = 0;
   let completionSkipCooldownUntil = 0;
@@ -88,6 +96,9 @@
   let lastCountSignature = "";
   let lastTaskSummary = "";
   let lastPublishedSignature = "";
+  // 平台任务点数据缓存：来自学习通 attachments，完成状态以平台为准。
+  let platformTaskCache = { at: 0, href: "", tasks: [] };
+  const PLATFORM_TASK_TTL_MS = 5000;
   const taskMap = new Map();
   let floatingUi;
   let floatingCustomization = { width: 300, opacity: 100, mode: "light", compact: false };
@@ -197,6 +208,15 @@
     const phase = status.phase || "idle";
     floatingUi.statusTitle.textContent = floatingPhaseLabel(status.phase);
     floatingUi.statusMessage.textContent = status.message || "启用后自动检测页面任务";
+    const ai = status.ai || window.__yyAiHint || {};
+    const model = String(ai.model || "").trim();
+    const endpoint = String(ai.endpoint || "").trim();
+    const local = /127\.0\.0\.1|localhost/.test(endpoint);
+    floatingUi.aiModel.textContent = model
+      ? (local ? `Magpie · ${model}` : model)
+      : "未配置";
+    floatingUi.aiLine.classList.toggle("ok", Boolean(model && ai.ok !== false));
+    floatingUi.aiLine.classList.toggle("bad", Boolean(model && ai.ok === false));
     floatingUi.phaseChip.className = `phase-chip ${phase}`;
     floatingUi.headLed.className = `led ${phase}`;
     floatingUi.videoCount.textContent = String(status.videoCount || 0);
@@ -218,7 +238,10 @@
       ? `本节 视频 ${stats.videos} · 答题 ${stats.questions} · ${formatElapsed(stats.elapsed)}`
       : "";
     const todoList = status.taskSummary || "";
-    const todoWarn = status.nothingDetected
+    const hasActiveWork = Number(status.videoCount || 0) + Number(status.documentCount || 0) + Number(status.questionCount || 0) > 0
+      || (status.tasks || []).some((task) => task.state === "running" || task.state === "error")
+      || /playing|reading|answering/.test(String(status.phase || ""));
+    const todoWarn = status.nothingDetected && !hasActiveWork
       ? "已启用 1 分钟仍没识别到任何任务：本节可能确实没有内容，也可能是没认出来。点「复制诊断」把信息发我。"
       : "";
     floatingUi.todo.classList.toggle("on", Boolean(todoList || todoWarn));
@@ -230,6 +253,7 @@
     settings = { ...settings, ...patch };
     await chrome.storage.local.set({ [storageKey]: settings });
     renderFloatingSettings();
+    refreshAiHint();
     scan();
   }
 
@@ -268,7 +292,24 @@
     chrome.storage.local.set({ floatUiCustomization: floatingCustomization }).catch(() => {});
   }
 
-  async function initFloatingWindow() {
+  
+  async function refreshAiHint() {
+    try {
+      const stored = await chrome.storage.local.get(['aiConfig']);
+      const cfg = stored.aiConfig || {};
+      window.__yyAiHint = {
+        model: cfg.model || '',
+        endpoint: cfg.endpoint || '',
+        ok: Boolean(cfg.endpoint && cfg.model)
+      };
+      if (floatingUi) renderFloatingStatus(runtimeStatus);
+    } catch (_) {}
+  }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.aiConfig) refreshAiHint();
+  });
+
+async function initFloatingWindow() {
     if (window !== window.top || floatingUi || !document.documentElement) return;
     const host = document.createElement("div");
     host.id = "kehang-floating-host";
@@ -286,7 +327,7 @@
         .body{padding:12px}.panel.collapsed .body{display:none}.panel.collapsed{width:236px}.panel.collapsed .collapse svg{transform:rotate(180deg)}.icon-btn svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s}.body::-webkit-scrollbar{width:6px}.body::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--faint) 40%,transparent);border-radius:99px}
         .status{padding:1px 2px 11px}.status .row1{display:flex;align-items:center;justify-content:space-between}.phase-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:99px;background:var(--surface);color:var(--ink);font-size:10px;font-weight:700}.phase-chip i{width:6px;height:6px;border-radius:50%;background:var(--faint);transition:background .3s}.phase-chip.playing i,.phase-chip.reading i,.phase-chip.answering i,.phase-chip.scanning i{background:var(--go);animation:phasepulse 1.4s infinite}.phase-chip.done i{background:var(--go)}.phase-chip.error i,.phase-chip.paused i,.phase-chip.stopped i{background:var(--err)}@keyframes phasepulse{50%{opacity:.45}}
         .progress{height:3px;margin-top:9px;border-radius:99px;background:var(--track);overflow:hidden}.progress i{display:block;height:100%;border-radius:99px;background:var(--on);transition:width .4s ease}
-        .status strong,.status small{display:block}.status small{margin-top:8px;overflow:hidden;color:var(--faint);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.status-count{display:flex;align-items:baseline;gap:1px;color:var(--faint);font-size:10px;font-weight:700}.status-count b{color:var(--ink);font-size:11.5px;font-variant-numeric:tabular-nums}.status-count span{font-variant-numeric:tabular-nums}
+        .status strong,.status small{display:block}.status small{margin-top:8px;overflow:hidden;color:var(--faint);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.ai-line{display:flex;align-items:center;gap:6px;margin-top:7px;padding:5px 8px;border-radius:8px;background:var(--surface);color:var(--dim);font-size:9.5px;line-height:1.35}.ai-line b{color:var(--ink);font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ai-line .dot{width:6px;height:6px;border-radius:50%;background:var(--faint);flex:none}.ai-line.ok .dot{background:var(--go)}.ai-line.bad .dot{background:var(--err)}.status-count{display:flex;align-items:baseline;gap:1px;color:var(--faint);font-size:10px;font-weight:700}.status-count b{color:var(--ink);font-size:11.5px;font-variant-numeric:tabular-nums}.status-count span{font-variant-numeric:tabular-nums}
         .metrics{display:grid;grid-template-columns:repeat(3,1fr);margin:0 0 12px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.metric{text-align:center;padding:9px 0 8px;border-right:1px solid var(--line);transition:background .15s}.metric:hover{background:var(--surface)}.metric:last-child{border:0}.metric span{display:block;color:var(--faint);font-size:8.5px;font-weight:700;letter-spacing:1.2px}.metric b{display:block;margin-top:3px;font-size:16px;font-weight:700;font-variant-numeric:tabular-nums}
         .course{display:flex;align-items:baseline;gap:6px;padding:0 2px 10px;color:var(--faint);font-size:9.5px}.course b{color:var(--dim);font-variant-numeric:tabular-nums}.course .c-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.course .c-stat{flex:none;font-variant-numeric:tabular-nums}
         .todo{display:none;gap:3px;margin:-3px 2px 11px;padding:7px 8px;border-radius:8px;background:var(--surface);color:var(--dim);font-size:9.5px;line-height:1.5}.todo.on{display:grid}.todo .t-warn{color:var(--err)}
@@ -320,6 +361,7 @@
             <div class="row1"><span class="phase-chip idle"><i></i><strong class="status-title">等待启动</strong></span><span class="status-count"><b class="status-now">0</b>/<span class="status-total">0</span> 题</span></div>
             <div class="progress"><i class="progress-fill" style="width:0%"></i></div>
             <small class="status-message">启用后自动检测页面任务</small>
+            <div class="ai-line"><span class="dot"></span><span>模型</span><b class="ai-model">未配置</b></div>
           </div>
           <div class="metrics"><span class="metric"><span>视频</span><b class="video-count">0</b></span><span class="metric"><span>课件</span><b class="document-count">0</b></span><span class="metric"><span>题目</span><b class="question-count">0</b></span></div>
           <div class="course"><b class="c-count">—</b><span class="c-name">课程进度</span><span class="c-stat"></span></div>
@@ -342,7 +384,7 @@
     document.documentElement.append(host);
     const find = (selector) => shadow.querySelector(selector);
     floatingUi = {
-      host, panel: find(".panel"), head: find(".head"), headLed: find(".led"), phaseChip: find(".phase-chip"), statusTitle: find(".status-title"), statusMessage: find(".status-message"), statusNow: find(".status-now"), statusTotal: find(".status-total"), progressFill: find(".progress-fill"),
+      host, panel: find(".panel"), head: find(".head"), headLed: find(".led"), phaseChip: find(".phase-chip"), statusTitle: find(".status-title"), statusMessage: find(".status-message"), aiLine: find(".ai-line"), aiModel: find(".ai-model"), statusNow: find(".status-now"), statusTotal: find(".status-total"), progressFill: find(".progress-fill"),
       videoCount: find(".video-count"), documentCount: find(".document-count"), questionCount: find(".question-count"), activeTask: find(".task-line .txt"),
       courseCount: find(".c-count"), courseName: find(".c-name"), courseStat: find(".c-stat"), todo: find(".todo"), todoList: find(".t-list"), todoWarn: find(".t-warn"), stopButton: find(".stop"),
       enabled: find(".enabled"), autoResume: find(".auto-resume"), autoReadDocuments: find(".auto-document"), autoAnswer: find(".auto-answer"), autoSubmit: find(".auto-submit"), autoNext: find(".auto-next"), skipCompleted: find(".skip-completed"), playbackRate: find(".rate"),
@@ -578,7 +620,22 @@
   }
 
   function pendingVideos() {
-    return [...document.querySelectorAll("video")].filter((video) => !video.ended);
+    // Android shim propagates a completed task point from the parent frame here.
+    // Never replay a video whose task point the platform already marked finished.
+    if (globalThis.__YUEYUE_COMPLETED__) return [];
+    return [...document.querySelectorAll("video")].filter((video) => {
+      if (video.ended || ignoredVideos.has(video)) return false;
+      // Hidden / zero-size host iframes (catalog leftovers) must not block navigation.
+      try {
+        const host = window.frameElement;
+        if (host) {
+          const rect = host.getBoundingClientRect();
+          const style = window.getComputedStyle(host);
+          if (rect.width < 2 || rect.height < 2 || style.display === "none" || style.visibility === "hidden") return false;
+        }
+      } catch {}
+      return true;
+    });
   }
 
   function yieldPlayback() {
@@ -590,7 +647,11 @@
 
   async function anotherFramePlaying() {
     try {
-      const state = await chrome.runtime.sendMessage({ type: "PLAYBACK_ACTIVE_FRAME" });
+      const state = await Promise.race([
+        chrome.runtime.sendMessage({ type: "PLAYBACK_ACTIVE_FRAME" }),
+        new Promise((resolve) => setTimeout(() => resolve(null), 2500))
+      ]);
+      if (!state) return false;
       if (state?.self !== undefined) myFrameId = state.self;
       // frameId 0 是顶层 frame，布尔判断会把它当成“没有人在播”，必须显式判 null
       const active = state?.active;
@@ -620,12 +681,58 @@
     }
   }
 
+  let emptyChapterHits = 0;
+
+  function isEmptyKnowledgeCards() {
+    if (window !== window.top) return false;
+    try {
+      const iframe = document.querySelector("#iframe");
+      if (!iframe) return false;
+      const doc = iframe.contentDocument;
+      const win = iframe.contentWindow;
+      if (!doc || !win || doc.readyState !== "complete") return false;
+      if (!/knowledge\/cards/i.test(String(win.location?.href || iframe.src || ""))) return false;
+      const mArg = win.mArg;
+      const emptyMarg = mArg === "" || mArg == null
+        || (typeof mArg === "object" && !Array.isArray(mArg?.attachments) && !(mArg?.attachments?.length));
+      const ans = doc.querySelector(".ans-cc");
+      const emptyAns = !ans || !(ans.innerHTML || "").trim();
+      const noMedia = doc.querySelectorAll("video, .ans-job-icon, .ans-attach-ct, .attach-file").length === 0;
+      return Boolean(emptyMarg && emptyAns && noMedia);
+    } catch {
+      return false;
+    }
+  }
+
   async function pendingVideosAnywhere() {
     if (pendingVideos().length) return true;
     try {
-      const state = await chrome.runtime.sendMessage({ type: "ANY_FRAMES_PENDING" });
-      return Boolean(state?.pending);
-    } catch { return false; }
+      const state = await Promise.race([
+        chrome.runtime.sendMessage({ type: "ANY_FRAMES_PENDING" }),
+        // 超时用哨兵对象，绝不能把“未知”当成“没有待播”——Android 通道抖动时会误跳章。
+        new Promise((resolve) => setTimeout(() => resolve({ __timeout: true }), 2500))
+      ]);
+      if (!state || state.__timeout) return true;
+      return Boolean(state.pending);
+    } catch {
+      return true;
+    }
+  }
+
+  // 后台 service worker 被回收或消息通道异常时，sendMessage 可能长时间不返回。
+  // 翻页请求必须有明确上限，否则 nextInProgress 永久为真，整节卡死。
+  async function requestNextWithTimeout(message, timeoutMs = 20000) {
+    let timer;
+    try {
+      return await Promise.race([
+        chrome.runtime.sendMessage(message),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve({ ok: false, error: `下一节请求 ${Math.round(timeoutMs / 1000)} 秒未响应` }), timeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   function locallyPlaying() {
@@ -888,6 +995,88 @@
     };
   }
 
+  async function fetchPlatformTasks() {
+    if (Date.now() - platformTaskCache.at < PLATFORM_TASK_TTL_MS && platformTaskCache.href === location.href) {
+      return platformTaskCache.tasks;
+    }
+    try {
+      const result = await chrome.runtime.sendMessage({ type: "GET_CX_STATE" });
+      if (result?.ok && Array.isArray(result.tasks)) {
+        platformTaskCache = { at: Date.now(), href: location.href, tasks: result.tasks };
+        return result.tasks;
+      }
+    } catch {}
+    return [];
+  }
+
+  function currentFrameJobId() {
+    try {
+      const raw = window.frameElement?.getAttribute?.("data");
+      if (!raw) return "";
+      const data = JSON.parse(raw);
+      return String(data?.jobid || data?._jobid || "");
+    } catch {
+      return "";
+    }
+  }
+
+  // 当前 frame 对应的平台任务若已学完，就直接隔离本页视频，不再从 0 重播。
+  function ignoreCompletedFrameVideo(tasks) {
+    try {
+      if (!Array.isArray(tasks) || !tasks.length) return false;
+      const jobid = currentFrameJobId();
+      if (!jobid) return false;
+      const task = tasks.find((item) => item && String(item.jobid || "") === jobid);
+      if (!task) return false;
+      const mediaModules = ["insertvideo", "insertaudio", "insertflash"];
+      if (!mediaModules.includes(String(task.module || ""))) return false;
+      const video = document.querySelector("video");
+      if (!video) return false;
+      const duration = Number(task.duration || video.duration || 0);
+      const reachedEnd = duration > 0 && Number(task.studyTotal || 0) >= duration - 3;
+      if (!task.isPassed && !reachedEnd) return false;
+      ignoredVideos.add(video);
+      readyForNavigation = true;
+      logEvent("platform", `平台记录本视频已完成${task.isPassed ? "（isPassed）" : "（进度已满）"}，本次刷新不再重播`);
+      return true;
+    } catch (error) {
+      logEvent("platform", `读取已完成视频失败：${error.message}`);
+      return false;
+    }
+  }
+
+  // 平台任务点是最硬的完成依据。视频按 studyTotal 与时长判定，避免服务端 isPassed 写入延迟造成反复重学。
+  function platformCompletion(tasks) {
+    try {
+      if (!Array.isArray(tasks) || !tasks.length) return null;
+      const validTasks = tasks.filter((task) => task && (task.job || task.isPassed || task.jobid || task.mid));
+      if (!validTasks.length) return null;
+      const pending = validTasks.filter((task) => {
+        if (!task.job) return false;
+        if (!task.isPassed) {
+          const duration = Number(task.duration || 0);
+          const studied = Number(task.studyTotal || 0);
+          const media = ["insertvideo", "insertaudio", "insertflash"].includes(String(task.module || ""));
+          if (media && duration > 0 && studied >= duration - 3) return false;
+          return true;
+        }
+        return false;
+      });
+      if (!pending.length) {
+        return { complete: true, reason: `平台记录 ${validTasks.length} 个任务点均已完成`, source: "platform" };
+      }
+      return {
+        complete: false,
+        reason: `平台记录还有 ${pending.length} 个任务点未完成`,
+        source: "platform",
+        pending: pending.map((task) => task?.name || task?.module || task?.jobid || "未知任务")
+      };
+    } catch (error) {
+      logEvent("platform", `平台任务状态解析失败：${error.message}`);
+      return null;
+    }
+  }
+
   function summarizeChapterTasks(tasks) {
     if (!tasks) return "";
     if (tasks.pending.length) {
@@ -901,13 +1090,20 @@
 
   // 已启用却一直什么都没识别到：要能分清「本节确实没内容」和「我没认出来」
   function trackNothingDetected(found) {
+    // 子 frame 只负责清标记；「没识别到」只由顶层根据聚合结果发出，避免空 iframe 误报污染浮窗。
     if (found || !settings.enabled) {
       idleDetectSince = 0;
-      idleDetectedNotified = false;
+      if (idleDetectedNotified || runtimeStatus.nothingDetected) {
+        idleDetectedNotified = false;
+        publishStatus({ nothingDetected: false });
+      } else {
+        idleDetectedNotified = false;
+      }
       clearTimeout(idleCheckTimer);
       idleCheckTimer = undefined;
       return;
     }
+    if (window !== window.top) return;
     if (!idleDetectSince) {
       idleDetectSince = Date.now();
       clearTimeout(idleCheckTimer);
@@ -915,6 +1111,14 @@
       return;
     }
     if (idleDetectedNotified || Date.now() - idleDetectSince < IDLE_DETECT_MS) return;
+    // 聚合计数或进行中任务已证明有内容时，禁止误报。
+    const activeTask = (runtimeStatus.tasks || []).some((task) => task.state === "running" || task.state === "error");
+    const hasContent = Number(runtimeStatus.videoCount || 0) + Number(runtimeStatus.documentCount || 0) + Number(runtimeStatus.questionCount || 0) > 0;
+    // 仅有 playing 相位、没有真实计数时不能当成有内容，否则空章节会永久自锁。
+    if (activeTask || hasContent) {
+      idleDetectSince = 0;
+      return;
+    }
     idleDetectedNotified = true;
     logEvent("detect", "启用后 1 分钟仍未识别到任何任务");
     publishStatus({ phase: "idle", nothingDetected: true });
@@ -982,29 +1186,40 @@
   }
 
   async function playVideo(video) {
-    if (!settings.enabled || userStopped) return;
-    if (Date.now() < playbackYieldUntil) return;
+    if (!settings.enabled || userStopped) return false;
+    if (Date.now() < playbackYieldUntil) return false;
     const queue = pendingVideos();
     if (queue[0] !== video) {
       if (!video.paused && !video.ended) video.pause();
-      return;
+      return false;
     }
     for (const other of queue.slice(1)) {
       if (!other.paused) other.pause();
     }
-    if (await anotherFramePlaying()) return;
+    if (await anotherFramePlaying()) return false;
     video.muted = settings.muted;
     video.playbackRate = settings.playbackRate;
-    if (!settings.autoResume || suspendVideoForQuiz || video.ended || Date.now() < intentionalPauseUntil) return;
+    if (!settings.autoResume || suspendVideoForQuiz || video.ended || Date.now() < intentionalPauseUntil) return false;
+    let playTimeout;
     try {
-      await video.play();
+      // 某些加载异常会让 play() 的 Promise 一直 pending；不能让它把单任务执行器永久占住。
+      await Promise.race([
+        video.play(),
+        new Promise((_, reject) => {
+          playTimeout = setTimeout(() => reject(new Error("播放请求超时")), 15000);
+        })
+      ]);
       const taskId = videoTaskIds.get(video);
       if (taskId) updateTask(taskId, { state: "running", detail: `${video.currentTime ? Math.floor(video.currentTime) + " 秒 · " : ""}${settings.playbackRate}× 播放` });
       publishStatus({ phase: "playing", message: "视频正在播放" });
       reportPlaybackState(true, true);
       watchPlayback(video);
+      return true;
     } catch {
-      // 浏览器可能要求用户先与页面交互；下一轮扫描会重试。
+      // 浏览器可能要求用户先与页面交互；执行器按无进展超时处理，不会永久空转。
+      return false;
+    } finally {
+      clearTimeout(playTimeout);
     }
   }
 
@@ -1044,7 +1259,7 @@
         activeQuiz = Boolean(quizState?.active);
       } catch {}
     }
-    if (activeQuiz) {
+    if (!force && activeQuiz) {
       updateTask("navigation", { label: "切换下一节", type: "navigation", state: "waiting", detail: "视频弹题尚未处理，暂停跳转" });
       publishStatus({ phase: "answering", message: "检测到视频弹题，答题提交后再进入下一节" });
       clearTimeout(quizDeferredNextTimer);
@@ -1060,7 +1275,7 @@
     for (let attempt = 1; attempt <= retryCount; attempt += 1) {
       try {
         updateTask("navigation", { state: "running", detail: `正在定位下一节（第 ${attempt}/${retryCount} 次）` });
-        delegated = await chrome.runtime.sendMessage({ type: "REQUEST_NEXT", siteKey, nextSelector: settings.nextSelector });
+        delegated = await requestNextWithTimeout({ type: "REQUEST_NEXT", siteKey, nextSelector: settings.nextSelector });
         if (delegated?.blocked) {
           nextInProgress = false;
           completionSignature = "";
@@ -1114,23 +1329,13 @@
       updateTask(taskId, { state: "done", detail: "播放完成" });
       clearStallWatch(video);
       sectionStats.videos += 1;
-      const next = pendingVideos()[0];
-      if (next) {
-        playVideo(next);
-        return;
-      }
       reportPlaybackState(false, true);
-      (async () => {
-        if (await pendingVideosAnywhere()) {
-          publishStatus({ phase: "playing", message: "本 frame 视频已完成，等待其他视频播放完成" });
-          clearTimeout(quizDeferredNextTimer);
-          quizDeferredNextTimer = setTimeout(() => {
-            pendingVideosAnywhere().then((pending) => { if (!pending) goNext(); });
-          }, 1200);
-          return;
-        }
-        goNext();
-      })();
+      // 事件只负责汇报完成，不直接启动下一个视频或翻页；后续动作统一交给执行器。
+      // 即使视频播完时尚未被锁定为 activeJob（快速视频或页面加载后才 attach），也必须置位：
+      // 这是“视频确实结束”的硬证据，否则执行器会一直停在已完成页面。
+      if (activeJob?.kind === "video" && activeJob.element === video) activeJob = null;
+      readyForNavigation = true;
+      scheduleOrchestrator();
     });
     video.addEventListener("ratechange", () => {
       if (settings.enabled && video.playbackRate !== settings.playbackRate) video.playbackRate = settings.playbackRate;
@@ -1768,7 +1973,7 @@
     let unique = readers.filter((reader, index, all) => all.indexOf(reader) === index && (isUsable(reader) || reader.tagName === "IFRAME"));
     if (!unique.length && documentUrlLooksLikeReader()) unique.push(document.documentElement);
     // 防御：`[class*='insertdoc']` 这类宽选择器会把阅读器内部成百上千个同类节点都选中。
-    // 若全部当成“课件”，processDocuments 会挨个滚动（1500+ × 80 步）必然假死。只保留像阅读区的大块容器。
+    // 若全部当成“课件”，课件执行器会挨个滚动（1500+ × 80 步）必然假死。只保留像阅读区的大块容器。
     const looksLikeReaderBox = (element) => {
       if (element === document.documentElement) return true;
       try {
@@ -1897,9 +2102,7 @@
       if (stableAtEnd >= 2) {
         completedDocumentReaders.add(documentKey);
         updateTask(taskId, { state: "done", detail: `课件已读到末尾${pageClicks ? ` · 翻页 ${pageClicks} 次` : ""}` });
-        publishStatus({ phase: "done", message: "教学课件已阅读完成，准备进入下一节" });
-        clearTimeout(documentCompletionTimer);
-        documentCompletionTimer = setTimeout(() => goNext(), 1200);
+        publishStatus({ phase: "done", message: "教学课件已阅读完成，准备处理下一项任务" });
         return true;
       }
       await new Promise((resolve) => setTimeout(resolve, 700));
@@ -1908,19 +2111,6 @@
     updateTask(taskId, { state: "error", detail: "课件阅读超过最大步骤，请检查页面是否需要手动翻页" });
     publishStatus({ phase: "error", message: "课件没有在预期步骤内完成，请查看任务队列" });
     return false;
-  }
-
-  async function processDocuments() {
-    if (!settings.enabled || !settings.autoReadDocuments || documentInFlight) return false;
-    const readers = findDocumentReaders();
-    if (!readers.length) return false;
-    documentInFlight = true;
-    try {
-      for (let index = 0; index < readers.length; index += 1) await completeDocumentReader(readers[index], index);
-      return true;
-    } finally {
-      documentInFlight = false;
-    }
   }
 
   function normalizeAnswerText(value) {
@@ -2168,11 +2358,15 @@
           const shouldSelect = selected.has(index);
           const ariaSelected = element.getAttribute("aria-checked") === "true" || element.classList.contains("selected") || element.classList.contains("active");
           if (control) {
+            // 学习通作业页要用 li/label 触发 inputAddChoice；只点 input 常常不落库。
+            const host = element?.closest?.("li, label, [role='radio'], [role='checkbox']") || element;
             if (control.type === "checkbox" && control.checked !== shouldSelect) {
-              control.click();
+              (host || control).click();
+              if (control.checked !== shouldSelect) control.click();
               changed = true;
             } else if (control.type === "radio" && shouldSelect && !control.checked) {
-              control.click();
+              (host || control).click();
+              if (!control.checked) control.click();
               changed = true;
             } else if (shouldSelect && control.checked) {
               changed = true;
@@ -2295,7 +2489,15 @@
       } else if (question.optionElements.length) {
         const highlighted = [...question.container.querySelectorAll("span.check_answer, span.check_answer_dx")]
           .some((span) => span.getAttribute("data"));
-        if (highlighted) filledCount += 1;
+        // 作业页 doHomeWorkNew 没有 check_answer 高亮，以 radio/checkbox checked 为平台真实选中态。
+        const nativeChecked = question.optionElements.some(({ control, element }) =>
+          Boolean(control?.checked) ||
+          element?.getAttribute?.("aria-checked") === "true" ||
+          element?.classList?.contains("selected") ||
+          element?.classList?.contains("active") ||
+          element?.querySelector?.("input[type='radio']:checked, input[type='checkbox']:checked")
+        );
+        if (highlighted || nativeChecked) filledCount += 1;
         else report.push({ q: index, type: question.type, blanks: question.textControls.length, options: question.optionElements.length, reason: "选项高亮缺失，平台不会记录此题" });
       }
     });
@@ -2337,6 +2539,20 @@
     }
   }
 
+  function findVideoQuizSubmitButton(questions = []) {
+    const container = questions.find(isBlockingVideoQuiz)?.container;
+    const roots = [container, container?.parentElement, container?.closest?.("#ext-comp-1046")].filter(Boolean);
+    const selectors = ["#videoquiz-submit", ".ans-videoquiz-submit", ".video-quiz-submit", "[data-action='videoquiz-submit']"];
+    for (const root of roots) {
+      for (const selector of selectors) {
+        const candidate = root.querySelector?.(selector);
+        if (isUsable(candidate)) return candidate;
+      }
+    }
+    // 视频弹题只允许点专用提交，绝不回退到页面主提交按钮，避免视频未完成就提交整节任务点。
+    return null;
+  }
+
   function findQuizContinueButton(questions = []) {
     const blockingContainer = questions.find(isBlockingVideoQuiz)?.container;
     const roots = [blockingContainer, blockingContainer?.parentElement, document].filter(Boolean);
@@ -2370,26 +2586,195 @@
     setTimeout(poll, 300);
   }
 
+  function accessibleDocuments() {
+    const docs = [document];
+    const walk = (root, depth) => {
+      if (!root || depth > 3) return;
+      for (const frame of [...(root.querySelectorAll?.("iframe") || [])]) {
+        try {
+          const child = frame.contentDocument;
+          if (child && !docs.includes(child)) {
+            docs.push(child);
+            walk(child, depth + 1);
+          }
+        } catch {}
+      }
+    };
+    // 内容脚本可能运行在视频 iframe 里，而确认弹窗挂在顶层页面。
+    // 同源时从顶层文档向下遍历，才能同时覆盖父页面和兄弟 iframe。
+    try {
+      const topDoc = window.top?.document;
+      if (topDoc && !docs.includes(topDoc)) {
+        docs.push(topDoc);
+        walk(topDoc, 0);
+      }
+    } catch {}
+    walk(document, 0);
+    return docs;
+  }
+
+  function findSubmitConfirmInfo() {
+    const buttonText = (element) => normalizeText(element.innerText || element.textContent || element.value || "");
+    const acceptText = /确定提交|确认提交|确认交卷|是否确认提交/;
+    const rejectText = /未作答|请选择|请作答|答题未完成|答完/;
+    const buttonPattern = /^(提交|提交答案|确定|确认|确认提交|确认交卷)$/;
+    const docs = accessibleDocuments();
+    // 学习通专用确认框：#workpop 可见时，#popok 就是确认按钮。
+    // 该按钮文字由脚本动态填充，可能读不到「提交」，必须按 id 识别。
+    for (const doc of docs) {
+      const workpop = doc.querySelector?.("#workpop");
+      if (!workpop || !isUsable(workpop)) continue;
+      const content = normalizeText(doc.querySelector?.("#popcontent")?.innerText || doc.querySelector?.("#popcontent")?.textContent || workpop.innerText || "");
+      if (rejectText.test(content) && !acceptText.test(content)) {
+        return { status: "blocked", message: content.slice(0, 100) };
+      }
+      const ok = doc.querySelector?.("#popok");
+      if (isUsable(ok) && (/提交|交卷|确认|确定/.test(content) || acceptText.test(content))) {
+        return { status: "clicked", button: ok, message: content.slice(0, 100) };
+      }
+    }
+    const dialogs = docs.flatMap((doc) => [...(doc.querySelectorAll?.(
+      "#popok, [role=dialog], [role=alertdialog], .layui-layer-dialog, .layui-layer, .el-message-box, .modal, .dialog, .x-window, .x-message-box, [class*='dialog'], [class*='modal'], [class*='confirm'], [class*='popup']"
+    ) || [])]).filter(isUsable);
+    for (const dialog of dialogs.reverse()) {
+      const text = normalizeText(dialog.innerText || dialog.textContent || "");
+      if (!text) continue;
+      if (rejectText.test(text) && !acceptText.test(text)) {
+        return { status: "blocked", message: text.slice(0, 100) };
+      }
+      if (!/提交|交卷|确认|确定/.test(text)) continue;
+      const buttons = [...dialog.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit]")]
+        .filter((element) => isUsable(element) && buttonPattern.test(buttonText(element)));
+      if (buttons.length) return { status: "clicked", button: buttons[buttons.length - 1], message: text.slice(0, 100) };
+      return { status: "missing", message: text.slice(0, 100) };
+    }
+    // 不依赖弹窗 class：从“提交”按钮向上找最近包含确认文案的容器。
+    const allButtons = docs.flatMap((doc) => [...(doc.querySelectorAll?.("button, a, [role=button], input[type=button], input[type=submit]") || [])])
+      .filter((element) => isUsable(element) && buttonPattern.test(buttonText(element)));
+    for (const button of allButtons.reverse()) {
+      const ownerBody = button.ownerDocument?.body || document.body;
+      let node = button.parentElement;
+      for (let depth = 0; node && node !== ownerBody && depth < 9; depth += 1, node = node.parentElement) {
+        const text = normalizeText(node.innerText || node.textContent || "");
+        if (text.length <= 300 && acceptText.test(text)) return { status: "clicked", button, message: text.slice(0, 100) };
+      }
+    }
+    return { status: "none" };
+  }
+
+  async function clickSubmitConfirmDialog() {
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const info = findSubmitConfirmInfo();
+    if (info.status === "clicked") {
+      info.button.click();
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+    return info;
+  }
+
+  // 学习通作业/考试提交：内容脚本本身就运行在题目所在 frame 里，直接找到「提交」按钮并点击最稳，
+  // 不依赖 chrome.scripting 主世界执行（后台在主世界找不到入口或缺少站点授权时会静默失败，
+  // 造成“题都答完了却从不点提交、章节永远不跳过”的老问题）。后台提交仅作为兜底保留。
+  function findChaoxingSubmitControls(questions = []) {
+    let docs;
+    try { docs = accessibleDocuments(); } catch { docs = [document]; }
+    // 优先题目所在文档，再轮到其余同源文档（提交栏有时在题目 frame 之外的同源 iframe 里）
+    const preferred = [];
+    for (const question of questions) {
+      const doc = question?.container?.ownerDocument;
+      if (doc && !preferred.includes(doc)) preferred.push(doc);
+    }
+    const ordered = [...preferred, ...docs.filter((doc) => !preferred.includes(doc))];
+    const textOf = (element) => normalizeText(element?.innerText || element?.textContent || element?.value || "").replace(/\s+/g, "");
+    const badText = /保存|暂存|返回|上一步|取消|重做|重新填写|退出/;
+    const strict = [];
+    const loose = [];
+    const seen = new Set();
+    for (const doc of ordered) {
+      let nodes;
+      try {
+        nodes = [...doc.querySelectorAll("button, a, [role=button], input[type=button], input[type=submit], .btnSubmit, .btnBlueSubmit, .submitBtn, #submitBtn, [onclick]")];
+      } catch { continue; }
+      for (const element of nodes) {
+        if (!element || seen.has(element) || !isUsable(element)) continue;
+        seen.add(element);
+        const text = textOf(element);
+        const onclick = String(element.getAttribute?.("onclick") || "").toLowerCase();
+        const idClass = `${element.id || ""} ${typeof element.className === "string" ? element.className : ""}`.toLowerCase();
+        const isSubmitText = /提交|交卷/.test(text) && !badText.test(text);
+        const isSubmitFn = /submitanswer|btnbluesubmit|submitwork|submitpaper|submitexam|submithomework|answersubmit/.test(onclick);
+        const isSubmitId = /(?:^|[^a-z])(?:submit|tijiao|jiaojuan)(?:[^a-z]|$)/.test(idClass) && !/save|保存/.test(idClass) && !badText.test(text) && text.length <= 12;
+        if (isSubmitText || isSubmitFn) strict.push(element);
+        else if (isSubmitId) loose.push(element);
+      }
+    }
+    return strict.length ? strict : loose;
+  }
+
+  async function clickLocalChaoxingSubmit(taskId, questions = []) {
+    const controls = findChaoxingSubmitControls(questions);
+    for (const element of controls) {
+      try { element.scrollIntoView?.({ block: "center" }); } catch {}
+      try { element.focus?.(); } catch {}
+      element.click();
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      // 提交按钮点下去后平台通常弹「确认提交／是否交卷」：交给现有的跨 frame 确认逻辑处理。
+      const confirm = await clickSubmitConfirmDialog();
+      if (confirm.status === "blocked") {
+        return { ok: false, blocked: true, error: `平台拒绝提交：${confirm.message}` };
+      }
+      if (confirm.status === "clicked") {
+        updateTask(taskId, { state: "running", detail: `已提交并确认（${normalizeText(element.innerText || element.textContent || element.value || "提交").slice(0, 8)}）` });
+        return { ok: true, method: "local-button+confirm" };
+      }
+      // 没有确认框：核对是否真的提交成功（题目节点消失 / 出现成功文案）。页面若已刷新则此段不会执行。
+      const stillThere = controls.some((control) => control.isConnected);
+      const successText = /提交成功|已提交|交卷成功|考试已提交|作业已提交|已完成/.test(document.body?.innerText || "");
+      if (!stillThere || successText) {
+        updateTask(taskId, { state: "running", detail: "已点击提交" });
+        return { ok: true, method: "local-button" };
+      }
+      // 点了但既无确认也无成功提示，多半点到的是同名装饰按钮，交给后台兜底再试。
+      return { ok: false, error: "点击提交后未出现确认框或成功提示" };
+    }
+    return { ok: false, error: "当前页面没有找到提交按钮（可能不是作答页，或需要手动提交）" };
+  }
+
   async function submitAnsweredQuestions(aiConfig, questions, blockingVideoQuiz, taskId) {
     await new Promise((resolve) => setTimeout(resolve, 450));
     const chaoxingChapterTest = questions.some((question) => question.container?.matches?.(".TiMu, .newTiMu, .questionLi"));
     if (chaoxingChapterTest) {
+      // 本地优先：内容脚本与题目同处一个 frame，直接找到「提交」按钮点击最稳，
+      // 也避免了后台主世界执行因缺少站点授权/跨 frame 找不到入口而静默放弃提交。
+      const local = await clickLocalChaoxingSubmit(taskId, questions);
+      if (local.ok) return local;
+      if (local.blocked) return local;
+      // 本地没找到提交按钮时，再让后台在顶层主世界兜底（提交入口有时在题目 frame 之外的同源 iframe）。
       try {
         const result = await chrome.runtime.sendMessage({ type: "CHAOXING_SUBMIT" });
-        if (result?.ok) return result;
-        return { ok: false, error: result?.error || "学习通没有确认提交" };
+        if (result?.ok) {
+          // 后台只在题目所在 frame 提交；确认弹窗可能挂在顶层或另一个 iframe，再跨 frame 搜一次。
+          await clickSubmitConfirmDialog();
+          return result;
+        }
+        return { ok: false, error: local.error || result?.error || "学习通没有确认提交" };
       } catch (error) {
-        return { ok: false, error: error.message };
+        return { ok: false, error: local.error || error.message };
       }
     }
-    const submit = findSubmitButton(aiConfig.submitSelector, questions);
+    const submit = blockingVideoQuiz
+      ? findVideoQuizSubmitButton(questions)
+      : findSubmitButton(aiConfig.submitSelector, questions);
     if (!submit) {
-      if (blockingVideoQuiz) waitForQuizContinue(taskId, questions);
+      if (blockingVideoQuiz) return { ok: false, blocked: true, error: "视频弹题没有找到专用提交按钮，已取消，避免误提交整个任务点" };
       return { ok: false, error: "没有找到提交按钮" };
     }
     submit.click();
+    const confirm = await clickSubmitConfirmDialog();
+    if (confirm.status === "blocked") return { ok: false, blocked: true, error: `平台拒绝提交：${confirm.message}` };
+    if (confirm.status === "missing") return { ok: false, error: `提交确认弹窗没有找到确认按钮：${confirm.message}` };
     if (blockingVideoQuiz) waitForQuizContinue(taskId, questions);
-    return { ok: true, method: "button" };
+    return { ok: true, method: confirm.status === "clicked" ? "button+confirm" : "button" };
   }
 
   async function answerQuestions(force = false, suppressEmptyError = false) {
@@ -2406,7 +2791,7 @@
     const taskId = `quiz:${shortFingerprint(fingerprint)}`;
     if (!force && fingerprint === lastQuizFingerprint) {
       updateTask(taskId, { label: `题目组 · ${questions.length} 题`, type: "quiz", state: "done", detail: "已处理，跳过重复请求" });
-      return { ok: true, questionCount: questions.length, filledCount: 0, skipped: true };
+      return { ok: true, questionCount: questions.length, filledCount: 0, skipped: true, complete: true };
     }
     if (!force && fingerprint === lastQuizAttemptFingerprint && Date.now() - lastQuizAttemptAt < 30000) {
       return { ok: false, error: "同一组题目正在等待重试" };
@@ -2508,7 +2893,6 @@
       }
       rememberFailedQuestions(lastFillReport.map((record) => ({ ...record, stem: questions[record.q]?.payload?.stem || "" })));
       sectionStats.questions += filledCount;
-      lastQuizFingerprint = fingerprint;
 
       // 交卷是最终动作：普通章节测验是否提交完全由用户的「普通题提交」开关决定；
       // 视频内弹题（blockingVideoQuiz）不归该开关管，作答完立即提交，避免弹题悬空卡住视频。
@@ -2516,6 +2900,11 @@
       let submission = { ok: false };
       if (shouldSubmit && filledCount === questions.length) {
         submission = await submitAnsweredQuestions(aiConfig, questions, blockingVideoQuiz, taskId);
+      }
+      // 只有真正填完、且需要提交时已提交成功，才把这组题标记为已处理。
+      // 未填完或提交失败时保留重试资格，30 秒防重窗口后可由调度器自动重试。
+      if (filledCount === questions.length && (!shouldSubmit || submission.ok)) {
+        lastQuizFingerprint = fingerprint;
       }
       publishStatus({
         phase: "done", questionCount: questions.length, filledCount,
@@ -2531,7 +2920,12 @@
         state: filledCount === questions.length ? "done" : "error",
         detail: `${filledCount}/${questions.length} 已填写 · ${response.cached ? "命中缓存" : `请求 ${response.attempts || 1} 次`}${submission.ok ? ` · 已提交(${submission.method || "平台接口"})` : ""}${answerPreview ? ` · ${answerPreview}` : ""}`
       });
-      return { ok: true, questionCount: questions.length, filledCount };
+      return {
+        ok: true,
+        questionCount: questions.length,
+        filledCount,
+        complete: filledCount === questions.length && (!shouldSubmit || submission.ok)
+      };
     } catch (error) {
       console.error("[玥玥刷客] AI 答题失败：", error);
       noteAiFailure(error.message);
@@ -2543,9 +2937,11 @@
     }
   }
 
-  function detectCompletedTask() {
-    const tasks = readChapterTasks();
-    // 任务点清单是最硬的证据：每个任务点都带完成标记才算整节完成
+  function detectCompletedTask(tasks = readChapterTasks(), platformTasks = null) {
+    // 平台任务点数据优先：attachments 的 job/isPassed 是学习通自己的完成事实。
+    const platform = platformCompletion(platformTasks);
+    if (platform) return platform;
+    // 任务点清单是第二证据：每个任务点都带完成标记才算整节完成
     if (tasks?.allFinished) return { complete: true, reason: `本节 ${tasks.total} 个任务点均已完成`, source: "task-list" };
     const pageText = normalizeText(document.body?.innerText || "");
     // 清单里还有未完成任务点时，页面上的零散「完成」字样不算数（多半是别的章节的提示）
@@ -2583,8 +2979,16 @@
   async function skipCompletedTaskIfNeeded() {
     if (pendingVideos().length) return false;
     const elsewhere = await chrome.runtime.sendMessage({ type: "ANY_FRAMES_PENDING" }).catch(() => null);
-    if (elsewhere?.pending) {
-      updateTask("completion-check", { label: "完成状态检测", type: "navigation", state: "waiting", detail: `还有 ${elsewhere.pending} 个视频未播放完成，暂不跳过` });
+    // 消息失败/未知时禁止跳过：顶层 frame 本身没有 <video>，以前会把 null 当成“可以跳”。
+    if (!elsewhere || elsewhere.pending) {
+      updateTask("completion-check", {
+        label: "完成状态检测",
+        type: "navigation",
+        state: "waiting",
+        detail: !elsewhere
+          ? "跨 frame 待播状态未知，暂不跳过"
+          : `还有 ${elsewhere.pending} 个视频未播放完成，暂不跳过`
+      });
       return false;
     }
     if (!settings.enabled || !settings.autoNext || !settings.skipCompleted || nextInProgress) return false;
@@ -2598,8 +3002,12 @@
       }
     } catch {}
     if (Date.now() < completionSkipCooldownUntil) return false;
-    const result = detectCompletedTask();
+    const platformTasks = await fetchPlatformTasks();
+    const result = detectCompletedTask(readChapterTasks(), platformTasks);
     if (!result.complete) {
+      if (result.source === "platform") {
+        updateTask("completion-check", { label: "完成状态检测", type: "navigation", state: "waiting", detail: result.reason });
+      }
       completionSignature = "";
       completionStableCount = 0;
       return false;
@@ -2625,6 +3033,140 @@
     return true;
   }
 
+  function quizFingerprintFor(questions) {
+    return JSON.stringify(questions.map(({ payload }) => payload));
+  }
+
+  function discoverNextJob({ questions, readers }) {
+    if (questions.length && settings.autoAnswer) {
+      const fingerprint = quizFingerprintFor(questions);
+      const key = `${location.href}::${fingerprint}`;
+      if (!ignoredQuizFingerprints.has(key) && !completedQuizJobs.has(key)) {
+        return {
+          kind: "quiz", id: `quiz:${shortFingerprint(key)}`, key, fingerprint,
+          attempts: 0, nextAttemptAt: 0
+        };
+      }
+    }
+    if (settings.autoReadDocuments) {
+      const index = readers.findIndex((reader, readerIndex) => {
+        const key = `${location.href}:${readerIndex}`;
+        return reader.isConnected !== false && !completedDocumentReaders.has(key) && !failedDocumentReaders.has(key);
+      });
+      if (index >= 0) {
+        return { kind: "document", id: `document:${shortFingerprint(`${location.href}:${index}`)}`, element: readers[index], index, documentKey: `${location.href}:${index}` };
+      }
+    }
+    const video = pendingVideos()[0];
+    if (video) {
+      const now = Date.now();
+      return {
+        kind: "video", id: videoTaskIds.get(video) || "video:current", element: video,
+        lastTime: Number(video.currentTime || 0), lastProgressAt: now
+      };
+    }
+    return null;
+  }
+
+  function finishActiveJob(allowNavigation = false) {
+    activeJob = null;
+    if (allowNavigation) readyForNavigation = true;
+  }
+
+  function failActiveJob(reason) {
+    const job = activeJob;
+    if (!job) return;
+    if (job.kind === "video") {
+      ignoredVideos.add(job.element);
+      if (!job.element.paused && !job.element.ended) job.element.pause();
+      reportPlaybackState(false, true);
+      clearStallWatch(job.element);
+    } else if (job.kind === "document") {
+      failedDocumentReaders.add(job.documentKey);
+    } else if (job.kind === "quiz") {
+      ignoredQuizFingerprints.add(job.key);
+      reportVideoQuizState(false);
+    }
+    logEvent("job", `${job.kind} 任务失败并已跳过：${reason}`);
+    updateTask(job.id, { state: "error", detail: `${reason}，已跳过故障任务` });
+    activeJob = null;
+    forceNextAfterFailure = true;
+    readyForNavigation = true;
+  }
+
+  async function runActiveJob(context) {
+    const job = activeJob;
+    if (!job) return;
+    if (job.kind === "quiz") {
+      if (Date.now() < job.nextAttemptAt) return;
+      if (aiRetryNotBefore && Date.now() < aiRetryNotBefore) return;
+      const currentKey = `${location.href}::${quizFingerprintFor(context.questions)}`;
+      if (!context.questions.length || currentKey !== job.key) {
+        activeJob = null;
+        return;
+      }
+      const result = await answerQuestions(false);
+      if (result.complete) {
+        // 普通题是否翻页仍由平台完成状态决定；视频弹题完成后则恢复原视频任务。
+        completedQuizJobs.add(job.key);
+        finishActiveJob(false);
+        return;
+      }
+      job.attempts += 1;
+      if (job.attempts >= MAX_QUIZ_JOB_ATTEMPTS) {
+        failActiveJob(`连续 ${job.attempts} 轮仍未完成答题或提交`);
+      } else {
+        job.nextAttemptAt = Date.now() + 31000;
+        updateTask(job.id, { state: "waiting", detail: `本轮未完成，31 秒后进行第 ${job.attempts + 1} 轮` });
+      }
+      return;
+    }
+
+    if (job.kind === "document") {
+      if (job.element.isConnected === false) {
+        failActiveJob("课件节点已被页面移除");
+        return;
+      }
+      const complete = await completeDocumentReader(job.element, job.index);
+      if (complete) finishActiveJob(true);
+      else failActiveJob("课件在限定步骤内未能读完");
+      return;
+    }
+
+    if (job.kind === "video") {
+      const video = job.element;
+      if (video.ended) {
+        reportPlaybackState(false, true);
+        finishActiveJob(true);
+        return;
+      }
+      if (video.isConnected === false) {
+        failActiveJob("视频节点已被页面移除");
+        return;
+      }
+      const currentTime = Number(video.currentTime || 0);
+      if (Math.abs(currentTime - job.lastTime) >= 0.5) {
+        job.lastTime = currentTime;
+        job.lastProgressAt = Date.now();
+      }
+      // 用户主动暂停、等待其他 frame 或弹题接管都不算故障，等待时间不能累积成超时。
+      if (userStopped || !settings.autoResume || suspendVideoForQuiz) {
+        job.lastProgressAt = Date.now();
+        return;
+      }
+      if (await anotherFramePlaying()) {
+        job.lastProgressAt = Date.now();
+        return;
+      }
+      if (Date.now() - job.lastProgressAt >= VIDEO_JOB_STALL_MS) {
+        failActiveJob(`视频 ${Math.round(VIDEO_JOB_STALL_MS / 1000)} 秒没有推进`);
+        return;
+      }
+      await playVideo(video);
+      if (!video.paused && !video.ended) watchPlayback(video);
+    }
+  }
+
   async function orchestrate() {
     if (!settings.enabled || orchestratorRunning || quizInFlight) return;
     orchestratorRunning = true;
@@ -2632,58 +3174,81 @@
       if (guardCaptcha()) return;
       if (handleIncompleteTaskDialog()) return;
       checkStall();
-      if (aiRetryNotBefore && Date.now() < aiRetryNotBefore) {
-        const waitSeconds = Math.ceil((aiRetryNotBefore - Date.now()) / 1000);
-        publishStatus({ phase: "error", message: `AI 接口连续失败，${waitSeconds} 秒后自动重试（可先在「模型设置」里测试接口）` });
-        return;
-      }
       const stored = await chrome.storage.local.get("aiConfig");
       const aiConfig = buildAiConfig(stored.aiConfig || {});
-      const questions = await extractQuestions(aiConfig);
+      const allQuestions = await extractQuestions(aiConfig);
+      const allKey = allQuestions.length ? `${location.href}::${quizFingerprintFor(allQuestions)}` : "";
+      const quizIgnored = allKey && ignoredQuizFingerprints.has(allKey);
+      const questions = quizIgnored ? [] : allQuestions;
       const videos = [...document.querySelectorAll("video")];
       const readers = findDocumentReaders();
+      const platformTasks = await fetchPlatformTasks();
+      ignoreCompletedFrameVideo(platformTasks);
       const blockingVideoQuiz = questions.some(isBlockingVideoQuiz);
-      reportVideoQuizState(blockingVideoQuiz);
-      reportPlaybackState(locallyPlaying());
 
-      if (questions.length && settings.autoAnswer) {
-        if (blockingVideoQuiz) {
-          suspendVideoForQuiz = true;
-          videos.forEach((video) => {
-            video.pause();
-            const videoTaskId = videoTaskIds.get(video);
-            if (videoTaskId) updateTask(videoTaskId, { state: "waiting", detail: "检测到互动题，已暂停" });
-          });
-        }
-        await answerQuestions(false);
-        return;
-      }
-
-      if (await skipCompletedTaskIfNeeded()) return;
-
+      // 视频弹题优先级最高：抢占当前视频任务，处理完后原视频仍在待播队列里。
       if (blockingVideoQuiz) {
         suspendVideoForQuiz = true;
         videos.forEach((video) => video.pause());
-        publishStatus({ phase: "answering", message: "检测到视频弹题，请开启自动答题或手动完成" });
-        return;
-      }
-
-      if (readers.length && settings.autoReadDocuments) {
-        await processDocuments();
-        return;
-      }
-
-      if (suspendVideoForQuiz && !blockingVideoQuiz) {
-        suspendVideoForQuiz = false;
-        publishStatus({ phase: "playing", message: "题目已处理，正在恢复视频播放" });
-      }
-      if (!blockingVideoQuiz && pendingVideos().length && !userStopped) {
-        const target = pendingVideos()[0];
-        await playVideo(target);
-        if (!target.paused && !target.ended) watchPlayback(target); else clearStallWatch();
+        if (activeJob && activeJob.kind !== "quiz") activeJob = null;
+        if (!settings.autoAnswer) {
+          reportVideoQuizState(true);
+          publishStatus({ phase: "answering", message: "检测到视频弹题，请开启自动答题或手动完成" });
+          return;
+        }
       } else {
-        clearStallWatch();
+        reportVideoQuizState(false);
+        if (suspendVideoForQuiz) {
+          suspendVideoForQuiz = false;
+          publishStatus({ phase: "playing", message: "题目已处理，正在恢复视频播放" });
+        }
       }
+      reportPlaybackState(locallyPlaying());
+
+      if (!activeJob) activeJob = discoverNextJob({ questions, readers });
+      if (activeJob) {
+        await runActiveJob({ questions, readers });
+        return;
+      }
+
+      // 队列耗尽后才允许翻页。其他 frame 还有正常待播视频时继续等，不抢跳。
+      if (await pendingVideosAnywhere()) {
+        publishStatus({ phase: "playing", message: "当前任务已完成，等待其他视频播放结束" });
+        return;
+      }
+      if (isEmptyKnowledgeCards()) {
+        emptyChapterHits += 1;
+        publishStatus({
+          phase: "scanning",
+          videoCount: 0,
+          documentCount: 0,
+          message: `本节内容区为空（学习通未下发附件），确认 ${Math.min(emptyChapterHits, 3)}/3 后跳过`
+        });
+        if (emptyChapterHits >= 3) {
+          emptyChapterHits = 0;
+          readyForNavigation = true;
+          forceNextAfterFailure = true;
+          updateTask("empty-chapter", {
+            label: "空章节检测",
+            type: "navigation",
+            state: "running",
+            detail: "cards 无附件/无任务点，准备跳到下一节"
+          });
+        } else {
+          return;
+        }
+      } else {
+        emptyChapterHits = 0;
+      }
+      if (readyForNavigation) {
+        const force = forceNextAfterFailure;
+        readyForNavigation = false;
+        forceNextAfterFailure = false;
+        await goNext(force);
+        return;
+      }
+      if (await skipCompletedTaskIfNeeded()) return;
+
       const courseProgress = readCourseProgress();
       syncSectionContext(courseProgress?.chapter || "");
       const chapterTasks = readChapterTasks();
@@ -2693,8 +3258,9 @@
         sectionStats: { videos: sectionStats.videos, questions: sectionStats.questions, elapsed: Date.now() - sectionStats.startedAt }
       });
     } catch (error) {
-      publishStatus({ phase: "error", message: `实时任务检测失败：${error.message}` });
-      logEvent("error", `调度失败：${error.message}`);
+      const locationHint = String(error?.stack || "").split("\n").slice(1, 3).map((line) => line.trim()).join(" | ");
+      publishStatus({ phase: "error", message: `实时任务检测失败：${error.message}${locationHint ? ` [${locationHint}]` : ""}` });
+      logEvent("error", `调度失败：${error.message}${locationHint ? ` @ ${locationHint}` : ""}`);
     } finally {
       orchestratorRunning = false;
     }
@@ -2736,16 +3302,27 @@
     const countSignature = `${videos.length}:${documentCount}:${settings.enabled}`;
     const chapterTasks = settings.enabled ? readChapterTasks() : null;
     const taskSummary = summarizeChapterTasks(chapterTasks);
-    trackNothingDetected(videos.length + documentCount + Number(runtimeStatus.questionCount || 0) > 0);
+    const hasRunningTask = (runtimeStatus.tasks || []).some((task) => task.state === "running" || task.state === "error");
+    trackNothingDetected(
+      videos.length
+        + documentCount
+        + Number(runtimeStatus.questionCount || 0)
+        + (hasRunningTask ? 1 : 0)
+      > 0
+    );
     if (countSignature !== lastCountSignature || taskSummary !== lastTaskSummary) {
       lastCountSignature = countSignature;
       lastTaskSummary = taskSummary;
       publishStatus({
-        phase: settings.enabled ? (videos.length ? "playing" : "scanning") : "idle",
+        phase: settings.enabled ? (videos.length ? "playing" : (documentCount ? "reading" : "scanning")) : "idle",
         videoCount: videos.length,
         documentCount,
         taskSummary,
-        message: settings.enabled ? `检测到 ${videos.length} 个视频、${documentCount} 个课件，正在监听页面任务` : "当前站点已暂停"
+        message: settings.enabled
+          ? (videos.length || documentCount
+            ? `检测到 ${videos.length} 个视频、${documentCount} 个课件，正在监听页面任务`
+            : "未发现视频/课件，正在确认是否空章节")
+          : "当前站点已暂停"
       });
     }
     scheduleOrchestrator();
@@ -2770,7 +3347,14 @@
       return false;
     }
     if (message?.type === "FRAME_STATUS_UPDATE") {
-      runtimeStatus = { ...runtimeStatus, ...message.status };
+      const incoming = message.status || {};
+      runtimeStatus = {
+        ...runtimeStatus,
+        ...incoming,
+        // 聚合结果若未显式带 nothingDetected，必须清掉旧误报，避免粘住。
+        nothingDetected: Boolean(incoming.nothingDetected)
+      };
+      if (!runtimeStatus.nothingDetected) idleDetectedNotified = false;
       renderFloatingStatus(runtimeStatus);
       sendResponse({ ok: true });
       return false;

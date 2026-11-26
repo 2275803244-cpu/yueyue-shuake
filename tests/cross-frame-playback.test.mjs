@@ -20,8 +20,12 @@ function check(name, condition, detail = "") {
 const clock = { now: 1750000000000 };
 const fakeDate = { now: () => clock.now };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
-// 先让微任务里的异步链跑完（ended → 查询后台 → goNext），再冲刷定时器（goNext 里的 900ms 等待）
-async function settle(frame) { await tick(); await tick(); await frame.timers.flush(); await tick(); await tick(); }
+// ended 先唤醒执行器，执行器再进入 goNext；两轮冲刷分别覆盖 220ms 调度与 900ms 翻页等待
+async function settle(frame) {
+  await tick(); await tick();
+  await frame.timers.flush(); await tick(); await tick();
+  await frame.timers.flush(); await tick(); await tick();
+}
 
 function makeTimers() {
   const pending = [];

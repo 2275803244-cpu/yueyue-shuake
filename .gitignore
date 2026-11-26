@@ -1,0 +1,8 @@
+# 升级前的本地备份，不入库
+_backup-*/
+
+# 临时与系统文件
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

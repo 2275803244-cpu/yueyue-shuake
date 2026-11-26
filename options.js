@@ -43,6 +43,10 @@ const PROVIDER_PRESETS = {
   volcengine: {
     endpoint: "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
     model: "ep-请替换为推理接入点ID"
+  },
+  magpie: {
+    endpoint: "http://127.0.0.1:3425/v1/chat/completions",
+    model: "workbuddy/deepseek-v4.1-flash"
   }
 };
 
